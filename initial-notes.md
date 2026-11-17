@@ -18,12 +18,13 @@
 | 5 | Foundation – Containers under the hood | ~1:00:00 | System Hardening / Microservices | ✅ |
 | 6 | Cluster Reset | 1:18:18 | Lab | ✅ |
 | 7 | Cluster Setup – Network Policies | 1:18:53 | Cluster Setup | ✅ |
-| 8 | Cluster Setup – GUI Elements | 1:46:54 | Cluster Setup | ⏳ |
-| 9 | K8s Docs Version | 2:02:06 | — | ⏳ |
-| 10 | Cluster Setup – Secure Ingress | 2:02:48 | Cluster Setup | ⏳ |
-| 11 | Cluster Setup – Node Metadata Protection | 2:23:54 | Cluster Setup | ⏳ |
-| 12 | Cluster Setup – CIS Benchmarks | 2:34:13 | Cluster Setup | ⏳ |
-| 13 | Cluster Setup – Verify Platform Binaries | — | Cluster Setup | ⏳ |
+| 8 | Cluster Setup – GUI Elements | 1:46:54 | Cluster Setup | ✅ |
+| 9 | K8s Docs Version | 2:02:06 | — | ✅ |
+| 10 | Cluster Setup – Secure Ingress | 2:02:48 | Cluster Setup | ✅ |
+| 11 | Cluster Setup – Node Metadata Protection | 2:23:54 | Cluster Setup | ✅ |
+| 12 | Cluster Setup – CIS Benchmarks | 2:34:13 | Cluster Setup | ✅ |
+| 13 | Cluster Setup – Verify Platform Binaries | 2:47:47 | Cluster Setup | ✅ |
+| 14 | Cluster Hardening – RBAC | — | Cluster Hardening | ⏳ |
 
 ---
 
@@ -36,11 +37,11 @@
 4. [Containers Under the Hood](#4-containers-under-the-hood)
 5. [Domain 1 — Cluster Setup](#5-domain-1--cluster-setup)
    - [5.1 Network Policies](#51-network-policies)
-   - 5.2 GUI Elements (Dashboard) — *TODO*
-   - 5.3 Secure Ingress — *TODO*
-   - 5.4 Node Metadata Protection — *TODO*
-   - 5.5 CIS Benchmarks (kube-bench) — *TODO*
-   - 5.6 Verify Platform Binaries — *TODO*
+   - [5.2 GUI Elements (Dashboard)](#52-gui-elements-kubernetes-dashboard)
+   - [5.3 Secure Ingress](#53-secure-ingress)
+   - [5.4 Node Metadata Protection](#54-node-metadata-protection)
+   - [5.5 CIS Benchmarks (kube-bench)](#55-cis-benchmarks-kube-bench)
+   - [5.6 Verify Platform Binaries](#56-verify-platform-binaries)
 6. [Domain 2 — Cluster Hardening](#6-domain-2--cluster-hardening) — *TODO*
 7. [Domain 3 — System Hardening](#7-domain-3--system-hardening) — *TODO*
 8. [Domain 4 — Minimize Microservice Vulnerabilities](#8-domain-4--minimize-microservice-vulnerabilities) — *TODO*
@@ -571,19 +572,422 @@ kubectl exec <pod> -- curl -m2 <target>         # timeout = blocked by policy; r
 ---
 
 ### 5.2 GUI Elements (Kubernetes Dashboard)
-*TODO — next screenshots*
+
+#### Concept
+**Control access to GUI elements:**
+- GUI elements and the Dashboard
+- Methods of accessing them from outside
+- Restricting access to them
+
+**Rules:**
+- Only expose services externally **if needed**.
+- Cluster-internal services and dashboards can also be reached with `kubectl port-forward`, so they don't need to be exposed at all.
+
+#### Real-world lesson: Tesla hack (2018)
+- The Kubernetes Dashboard **had too many privileges** on the cluster (no RBAC, or roles that were too broad).
+- The Dashboard **was exposed to the internet**, which isn't the default.
+- Attackers used it to run crypto miners inside Tesla's cluster.
+
+#### Access methods
+
+| Method | How it works | Notes |
+|---|---|---|
+| `kubectl proxy` | Creates a proxy between localhost and the **API server**. Uses the connection configured in the kubeconfig. | Lets you reach the API locally over plain **HTTP without authentication**. URL: `http://localhost:8001/api/v1/...` |
+| `kubectl port-forward` | Forwards connections from a **localhost port to a pod port** (tunnelled through the API server over HTTPS) | More generic than `kubectl proxy`, and works for **any TCP traffic**, not just HTTP |
+| Ingress | `https://my-cluster/dashboard` → Nginx Ingress → Dashboard pod | Needs proper authentication in front of it |
+| NodePort / LoadBalancer | Directly exposed | ❌ Avoid for dashboards |
+
+```bash
+kubectl proxy                                                           # then:
+# http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/https:kubernetes-dashboard:/proxy/
+kubectl -n kubernetes-dashboard port-forward svc/kubernetes-dashboard 8443:443   # then https://localhost:8443
+```
+
+#### Install (2026 note)
+> ⚠️ The Dashboard project is **archived** (moved to `kubernetes-retired`, Jan 2026). Its successor is **Headlamp**. For the course, use v2.7.0, which has the same args the video uses:
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/kubernetes-retired/dashboard/v2.7.0/aio/deploy/recommended.yaml
+```
+- The old Helm repo URL `https://kubernetes.github.io/dashboard/` returns **404**. The chart now lives at `https://kubernetes-retired.github.io/dashboard/`.
+- Headlamp: `helm repo add headlamp https://kubernetes-sigs.github.io/headlamp/ && helm install headlamp headlamp/headlamp -n kube-system`
+
+#### Hands-on 1: Make the Dashboard available externally over HTTP (⚠️ don't do this at home!)
+Always back up first:
+```bash
+kubectl -n kubernetes-dashboard get deploy kubernetes-dashboard -o yaml > dashboard-backup.yaml
+kubectl -n kubernetes-dashboard edit deploy kubernetes-dashboard
+```
+```yaml
+        args:
+        # - --auto-generate-certificates     # removed → no TLS
+        - --namespace=kubernetes-dashboard
+        - --insecure-port=9090
+        - --enable-insecure-login             # v2.7.0: needed for login over HTTP
+        livenessProbe:
+          httpGet:
+            scheme: HTTP                      # was HTTPS
+            path: /
+            port: 9090                        # was 8443
+```
+```bash
+kubectl -n kubernetes-dashboard edit svc kubernetes-dashboard     # type: NodePort, port/targetPort 9090
+kubectl -n kubernetes-dashboard get svc                          # → 9090:3xxxx/TCP
+```
+Open `http://<node-PUBLIC-ip>:<nodeport>`. A private IP only works from inside the VPC, and the security group has to allow the NodePort range.
+
+Restore the secure setup: `kubectl replace --force -f dashboard-backup.yaml`
+
+#### Hands-on 2: Dashboard + RBAC
+**Task:** give the Dashboard ServiceAccount more permissions, and check out other Dashboard arguments.
+
+```bash
+kubectl -n kubernetes-dashboard get sa
+kubectl get clusterroles | grep view                 # view = read-only built-in role
+
+# namespace-scoped read access (RoleBinding → only kubernetes-dashboard ns)
+kubectl -n kubernetes-dashboard create rolebinding insecure --serviceaccount kubernetes-dashboard:kubernetes-dashboard --clusterrole view
+
+# cluster-wide read access (ClusterRoleBinding → all namespaces)
+kubectl create clusterrolebinding insecure --serviceaccount kubernetes-dashboard:kubernetes-dashboard --clusterrole view
+```
+> 💡 **RoleBinding + ClusterRole** = the ClusterRole's permissions, but **only in that namespace**. **ClusterRoleBinding** = cluster-wide. Never bind the Dashboard SA to `cluster-admin`.
+
+Token for login (with a separate viewer SA):
+```bash
+kubectl -n kubernetes-dashboard create sa viewer && kubectl create clusterrolebinding viewer --clusterrole=view --serviceaccount=kubernetes-dashboard:viewer && kubectl -n kubernetes-dashboard create token viewer
+```
+
+#### Interesting Dashboard security arguments
+| Arg | Risk |
+|---|---|
+| `--authentication-mode=basic` | Basic auth. Weak, and removed in newer versions |
+| `--enable-skip-login=true` | ❌ Shows a "Skip" button. Anyone can log in as the Dashboard SA |
+| `--enable-insecure-login` | Allows login over HTTP |
+| `--insecure-port=9090` | Serves plain HTTP |
+| `--auto-generate-certificates` | ✅ Serves HTTPS with a self-signed cert |
+
+Full list: https://github.com/kubernetes-retired/dashboard/blob/master/docs/common/dashboard-arguments.md
+
+#### Section summary
+- Only expose externally if needed and if protected
+- Restrict using RBAC
+- Enforce authentication
+- Change (harden) arguments
+
+---
 
 ### 5.3 Secure Ingress
-*TODO*
+
+#### Concept
+**Ingress objects with security control:**
+- What is Ingress
+- Setting up an Ingress with Services
+- Securing an Ingress with TLS
+
+#### What is Ingress
+Service types build on each other: **LoadBalancer creates → NodePort, which creates → ClusterIP, which points to → the pod.**
+
+An **Ingress controller** (e.g. ingress-nginx) is just a pod exposed through a NodePort/LoadBalancer service. It reads `Ingress` resources and routes HTTP(S) by host/path to ClusterIP services.
+
+```
+Request ──(HTTPS)──► NodePort ──► Nginx Ingress ──/service1──► ClusterIP ──► pod1
+                                               └─/service2──► ClusterIP ──► pod2
+```
+
+> ⚠️ Before this lab, **delete all NetworkPolicies from previous sessions**: `kubectl delete netpol --all -A`
+>
+> ⚠️ **2026 note:** the community **ingress-nginx was retired in March 2026** (no more patches). It's fine for labs, but Gateway API is the successor. Options for exposing services: ClusterIP → NodePort → LoadBalancer → Ingress → Gateway API.
+
+#### Hands-on 1: Set up an example Ingress
+```bash
+# install ingress-nginx (bare metal = NodePort)
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.15.1/deploy/static/provider/baremetal/deploy.yaml
+kubectl -n ingress-nginx get svc     # note HTTP and HTTPS NodePorts, e.g. 80:32310, 443:30764
+
+kubectl run pod1 --image=nginx && kubectl expose pod pod1 --port 80 --name service1
+kubectl run pod2 --image=httpd && kubectl expose pod pod2 --port 80 --name service2
+```
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: secure-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+  - http:
+      paths:
+      - path: /service1
+        pathType: Prefix
+        backend:
+          service:
+            name: service1
+            port:
+              number: 80
+      - path: /service2
+        pathType: Prefix
+        backend:
+          service:
+            name: service2
+            port:
+              number: 80
+```
+```bash
+curl http://<node-ip>:<http-nodeport>/service1    # nginx page
+curl http://<node-ip>:<http-nodeport>/service2    # "It works!" (httpd)
+```
+
+#### Hands-on 2: Secure the Ingress with TLS
+Without a TLS secret, the controller serves its default **"Kubernetes Ingress Controller Fake Certificate"** (`O=Acme Co`).
+
+```bash
+# 1. create a self-signed cert (CN must match the host)
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=secure-ingress.com"
+# 2. store it in a TLS secret
+kubectl create secret tls secure-ingress --cert=cert.pem --key=key.pem
+```
+```yaml
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - secure-ingress.com
+    secretName: secure-ingress
+  rules:
+  - host: secure-ingress.com        # host is required to match the TLS entry
+    http:
+      paths: ...                    # same as above
+```
+```bash
+# 3. test (HTTPS NodePort; --resolve fakes DNS)
+curl -kv https://secure-ingress.com:<https-nodeport>/service2 --resolve secure-ingress.com:<https-nodeport>:<node-ip>
+```
+Check `subject:` in the output:
+- `CN=secure-ingress.com` → ✅ your cert is being served.
+- `CN=Kubernetes Ingress Controller Fake Certificate` → ❌ secret name/namespace wrong, or the host doesn't match.
+
+#### Gotchas (from my lab)
+- `--resolve` only applies if **host AND port match exactly**. A typo like `secure.ingress.com` vs `secure-ingress.com` → `curl: (6) Could not resolve host`.
+- Use the **HTTPS NodePort** (443:xxxxx), not the HTTP one.
+- Once `tls:` is set, HTTP requests for that host get a **308 redirect** to HTTPS.
+- `-k` is needed because the cert is self-signed. To verify properly, use `--cacert cert.pem` instead.
+- A 404 with the fake cert = request didn't match any rule (wrong host header).
+
+---
 
 ### 5.4 Node Metadata Protection
-*TODO*
+
+#### Concept
+**Protect node metadata and endpoints:**
+- Cloud platform node metadata
+- Accessing sensitive node metadata
+- Restricting access with NetworkPolicies
+
+#### Cloud platform node metadata
+- The metadata service API is **reachable from VMs by default** at `169.254.169.254`.
+- It can contain **cloud credentials** for VMs/nodes (IAM role creds).
+- It can contain **provisioning data** like kubelet credentials (bootstrap data).
+- Pods on the node can reach it too, so a compromised pod can steal node or cloud credentials.
+
+Goal: only specific pods may reach the metadata service, and all others are blocked.
+
+#### Hands-on 1: Access from the instance and from a pod (AWS, IMDSv2)
+```bash
+# on the node
+TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/iam/security-credentials/   # 🔥 IAM creds
+
+# from a pod
+kubectl run test --image=curlimages/curl -it --rm --restart=Never -- sh -c 'T=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60"); curl -s -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/'
+```
+| Cloud | Endpoint / header |
+|---|---|
+| AWS | `http://169.254.169.254/latest/meta-data/` (IMDSv2 needs a token via PUT) |
+| GCP | `http://metadata.google.internal/computeMetadata/v1/` + `Metadata-Flavor: Google` |
+| Azure | `http://169.254.169.254/metadata/instance?api-version=2021-02-01` + `Metadata: true` |
+
+> 💡 On AWS, IMDSv2 with **hop limit 1** already blocks pods (the token reply can't make the extra network hop into the pod). Harden it with:
+> `aws ec2 modify-instance-metadata-options --instance-id <id> --http-tokens required --http-put-response-hop-limit 1`
+
+#### Hands-on 2: Deny all pods access to the metadata endpoint
+```yaml
+# all pods in namespace cannot access metadata endpoint
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cloud-metadata-deny
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 169.254.169.254/32
+```
+
+#### Hands-on 3: Only allow pods with a certain label
+```yaml
+# only pods with label are allowed to access metadata endpoint
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cloud-metadata-allow
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      role: metadata-accessor
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 169.254.169.254/32
+```
+```bash
+kubectl label pod <pod> role=metadata-accessor      # this pod can reach metadata again
+```
+> 💡 Policies are **additive**. A labelled pod matches both policies, and the union of the egress rules = `0.0.0.0/0 except metadata` **+** `metadata` = everything. Unlabelled pods only get the deny policy.
+>
+> ⚠️ NetworkPolicies are namespaced, so you need the deny policy in **every** namespace.
+
+#### Section summary
+- Cloud metadata servers
+- Access from the instance
+- Access from a pod
+- Restrict access using NetworkPolicy
+
+---
 
 ### 5.5 CIS Benchmarks (kube-bench)
-*TODO*
+
+#### Concept
+**Use the CIS benchmark to review security configuration:**
+- Overview
+- CIS Benchmarks in action
+- kube-bench
+
+#### CIS — Center for Internet Security
+- Best practices for the **secure configuration** of a target system.
+- Covers more than 14 technology groups.
+- Developed through a consensus-based process by cybersecurity professionals and subject matter experts.
+
+```
+CIS Benchmarks (default K8s security rules)
+        ├──► Use and apply
+        └──► Customize (cloud providers: AWS/EKS, GCP/GKE, AKS) ──► Use and apply
+```
+- Video uses `CIS_Kubernetes_Benchmark_v1.6.0.pdf`. Rule numbers **change between versions**, so always read the rule text, not just the number.
+- Download: https://www.cisecurity.org/benchmark/kubernetes (free with registration)
+
+#### kube-bench
+An open-source tool by Aqua Security that checks a cluster against the CIS benchmark.
+
+```bash
+# option A: run as a Job (no docker needed on containerd nodes)
+kubectl apply -f https://raw.githubusercontent.com/aquasecurity/kube-bench/main/job-master.yaml
+kubectl logs job/kube-bench
+
+# option B: binary on the node
+kube-bench run --targets master          # control plane
+kube-bench run --targets node            # worker
+kube-bench run --targets master --check 1.1.12     # single check
+```
+Output: `[PASS]` / `[FAIL]` / `[WARN]` / `[INFO]` per check. Each FAIL comes with a **Remediation** text at the bottom that tells you exactly what to change.
+
+#### Hands-on: Fix rule 1.1.12 on the master node
+**1.1.12 — Ensure that the etcd data directory ownership is set to `etcd:etcd`**
+```bash
+kube-bench run --targets master --check 1.1.12      # [FAIL]
+ps -ef | grep etcd | grep data-dir                  # find data dir → /var/lib/etcd
+stat -c %U:%G /var/lib/etcd                         # root:root
+useradd etcd                                        # user may not exist
+chown etcd:etcd /var/lib/etcd
+kube-bench run --targets master --check 1.1.12      # [PASS]
+```
+
+#### Typical CIS fixes (exam favourites)
+| Check | Fix |
+|---|---|
+| apiserver `--profiling` | `--profiling=false` in `/etc/kubernetes/manifests/kube-apiserver.yaml` |
+| apiserver `--anonymous-auth` | `--anonymous-auth=false` |
+| apiserver `--authorization-mode` | Must include `Node,RBAC`, never `AlwaysAllow` |
+| apiserver audit logging | `--audit-log-path`, `--audit-log-maxage`, etc. |
+| controller-manager / scheduler `--profiling` | `--profiling=false` |
+| `--bind-address` | `127.0.0.1` for scheduler/controller-manager |
+| kubelet `anonymous.enabled` | `false` in `/var/lib/kubelet/config.yaml` → `systemctl restart kubelet` |
+| kubelet `authorization.mode` | `Webhook` |
+| File permissions/ownership | `chmod 600` / `chown root:root` on manifests and kubeconfigs |
+
+> 💡 **Exam tip:** back up the manifest before editing (`cp /etc/kubernetes/manifests/kube-apiserver.yaml ~/`), then `watch crictl ps` until the apiserver comes back. Re-run the single `--check` to confirm.
+
+#### Section summary
+- What CIS Benchmarks are
+- How to use kube-bench
+- How to apply and check fixes manually
+
+---
 
 ### 5.6 Verify Platform Binaries
-*TODO*
+
+#### Concept
+- Hashes
+- Download and verify binaries
+- Verify binaries from a container
+
+#### Theory: hashes
+`File ──(ONE WAY)──► Hash (fingerprint)`. Algorithms: SHA, MD5, …
+- The same file always gives the same hash. Change a single bit and you get a completely different hash.
+- You can't get back from the hash to the file.
+- Use it to prove a downloaded or running binary is **untampered** (supply-chain protection).
+
+#### Hands-on 1: Download and verify a Kubernetes release from GitHub
+```bash
+# match your cluster version
+kubectl version
+curl -LO https://dl.k8s.io/v1.xx.x/kubernetes-server-linux-amd64.tar.gz
+sha512sum kubernetes-server-linux-amd64.tar.gz
+# compare with the sha512 listed in the release CHANGELOG on GitHub (kubernetes/kubernetes/CHANGELOG)
+```
+Single binary with the official checksum file:
+```bash
+curl -LO https://dl.k8s.io/release/v1.xx.x/bin/linux/amd64/kubectl && curl -LO https://dl.k8s.io/release/v1.xx.x/bin/linux/amd64/kubectl.sha512
+echo "$(cat kubectl.sha512)  kubectl" | sha512sum --check      # → kubectl: OK
+```
+
+#### Hands-on 2: Verify the binary running inside a container (kube-apiserver)
+The apiserver image is **distroless**: there's no `sh` or `bash`, so `kubectl exec` fails (`executable file not found in $PATH`). Go through the **host's `/proc`** instead.
+
+```bash
+tar xzf kubernetes-server-linux-amd64.tar.gz
+kubernetes/server/bin/kube-apiserver --version                     # must match running version
+kubectl -n kube-system get pod kube-apiserver-<node> -o yaml | grep image
+sha512sum kubernetes/server/bin/kube-apiserver > compare
+
+# find the running process and its container filesystem
+ps aux | grep kube-apiserver                                       # → PID e.g. 1843
+find /proc/1843/root/ | grep kube-api                              # → /proc/1843/root/usr/local/bin/kube-apiserver
+sha512sum /proc/1843/root/usr/local/bin/kube-apiserver >> compare
+
+# compare: strip filenames, then uniq → 1 line = identical, 2 lines = tampered
+cut -d' ' -f1 compare | uniq
+```
+> 💡 `/proc/<PID>/root/` = the root filesystem **as the process sees it**, so you can reach inside any container from the host. You'll use this trick again in runtime security.
+
+#### Section summary
+- Hashes of files
+- Verify downloads using `sha512sum`
+- Verify binaries on the server or in a container
+
+🎉 **Domain 1 (Cluster Setup) complete.**
 
 ---
 
@@ -622,6 +1026,11 @@ kubeadm certs check-expiration
 openssl x509 -in <cert> -noout -text
 kubectl describe netpol -A
 kubectl get pod -A -o jsonpath='{range .items[?(@.spec.hostPID==true)]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'
+kubectl create secret tls <name> --cert=cert.pem --key=key.pem
+curl -kv https://<host>:<port>/path --resolve <host>:<port>:<ip>
+kube-bench run --targets master --check <id>
+sha512sum <binary>                       # compare against release checksum
+find /proc/<PID>/root/ | grep <binary>   # reach into a distroless container
 ```
 
 ### Exam-day reminders
