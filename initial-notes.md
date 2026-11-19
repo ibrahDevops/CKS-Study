@@ -24,7 +24,10 @@
 | 11 | Cluster Setup – Node Metadata Protection | 2:23:54 | Cluster Setup | ✅ |
 | 12 | Cluster Setup – CIS Benchmarks | 2:34:13 | Cluster Setup | ✅ |
 | 13 | Cluster Setup – Verify Platform Binaries | 2:47:47 | Cluster Setup | ✅ |
-| 14 | Cluster Hardening – RBAC | — | Cluster Hardening | ⏳ |
+| 14 | Cluster Hardening – RBAC | 2:59:32 | Cluster Hardening | ✅ |
+| 15 | Cluster Hardening – Exercise caution in using ServiceAccounts | 3:31:26 | Cluster Hardening | ✅ |
+| 16 | Cluster Hardening – Restrict API Access | 3:49:06 | Cluster Hardening | ✅ |
+| 17 | Cluster Hardening – Upgrade Kubernetes | 4:17:25 | Cluster Hardening | ⏳ |
 
 ---
 
@@ -42,7 +45,12 @@
    - [5.4 Node Metadata Protection](#54-node-metadata-protection)
    - [5.5 CIS Benchmarks (kube-bench)](#55-cis-benchmarks-kube-bench)
    - [5.6 Verify Platform Binaries](#56-verify-platform-binaries)
-6. [Domain 2 — Cluster Hardening](#6-domain-2--cluster-hardening) — *TODO*
+6. [Domain 2 — Cluster Hardening](#6-domain-2--cluster-hardening)
+   - [6.1 RBAC](#61-rbac--role-based-access-control)
+   - [6.2 Accounts: ServiceAccounts vs users](#62-accounts-serviceaccounts-vs-normal-users)
+   - [6.3 Exercise Caution in Using ServiceAccounts](#63-exercise-caution-in-using-serviceaccounts)
+   - [6.4 Restrict API Access](#64-restrict-api-access)
+   - 6.5 Upgrade Kubernetes — *TODO*
 7. [Domain 3 — System Hardening](#7-domain-3--system-hardening) — *TODO*
 8. [Domain 4 — Minimize Microservice Vulnerabilities](#8-domain-4--minimize-microservice-vulnerabilities) — *TODO*
 9. [Domain 5 — Supply Chain Security](#9-domain-5--supply-chain-security) — *TODO*
@@ -992,7 +1000,391 @@ cut -d' ' -f1 compare | uniq
 ---
 
 ## 6. Domain 2 — Cluster Hardening
-*TODO — RBAC, ServiceAccounts, restrict API access, upgrades*
+
+### 6.1 RBAC — Role Based Access Control
+
+#### Concept
+- Introduction to RBAC
+- Create scenarios
+- Certificates and "Users"
+
+> "Role-based access control (RBAC) is a method of regulating access to computer or network resources based on the roles of individual users within your organization."
+
+- Restricts access to Kubernetes resources when they're accessed by **Users or ServiceAccounts**.
+- Works with **Roles and Bindings**.
+- Specify what is **ALLOWED**; everything else is DENIED ("whitelisting").
+- **Permissions are additive.** There are no "deny" rules.
+
+```
+--authorization-mode   Default: [AlwaysAllow]
+Options: AlwaysAllow, AlwaysDeny, ABAC, Webhook, RBAC, Node
+kubeadm default: --authorization-mode=Node,RBAC
+```
+
+#### Namespaced vs cluster resources
+```bash
+kubectl api-resources --namespaced=true     # pods, secrets, deployments, roles …
+kubectl api-resources --namespaced=false    # nodes, PVs, namespaces, clusterroles …
+```
+
+#### Where permissions are available vs applied
+
+| | Where **available**? (set of permissions) | | Where **applied**? (who gets them) |
+|---|---|---|---|
+| **Role** | in one namespace | **RoleBinding** | applied in one namespace |
+| **ClusterRole** | in all namespaces + non-namespaced | **ClusterRoleBinding** | applied in all namespaces + non-namespaced |
+
+- Role/ClusterRole = a set of permissions ("can edit pods", "can read secrets").
+- Binding = **who** gets that set ("bind a Role/ClusterRole to something").
+
+**Valid combinations:**
+| Combo | Result |
+|---|---|
+| Role + RoleBinding | ✅ Permissions in one namespace |
+| ClusterRole + ClusterRoleBinding | ✅ Permissions in all namespaces + non-namespaced |
+| **ClusterRole + RoleBinding** | ✅ Reuse one ClusterRole, applied **only** in the RoleBinding's namespace. The user has the same permissions in multiple namespaces (one RoleBinding per namespace) |
+| Role + ClusterRoleBinding | ❌ Not possible |
+
+#### Permissions are additive
+```
+ClusterRole+ClusterRoleBinding ("get" & "delete" secrets)
+  + Role+RoleBinding ("get" secrets)
+  = "get" & "delete" secrets
+```
+> ⚠️ Be careful with ClusterRoles/ClusterRoleBindings. You can't take away in a namespace what a ClusterRoleBinding grants cluster-wide.
+
+#### Hands-on 1: Role + RoleBinding (jane)
+**Task:** create namespaces `red` and `blue`. User jane can only **get** secrets in `red`, and only **get + list** secrets in `blue`. Test with `auth can-i`.
+
+```bash
+k create ns red && k create ns blue
+k -n red  create role secret-manager --verb=get --resource=secrets
+k -n red  create rolebinding secret-manager --role=secret-manager --user=jane
+k -n blue create role secret-manager --verb=get --verb=list --resource=secrets
+k -n blue create rolebinding secret-manager --role=secret-manager --user=jane
+
+# test (as admin, impersonating jane)
+k -n red  auth can-i get secrets  --as jane        # yes
+k -n red  auth can-i list secrets --as jane        # no
+k -n blue auth can-i list secrets --as jane        # yes
+k -n blue auth can-i delete secrets --as jane      # no
+k -n default auth can-i get secrets --as jane      # no
+k -n red auth can-i --list --as jane               # everything jane can do in red
+```
+
+#### Hands-on 2: ClusterRole + (Cluster)RoleBinding (jane & jim)
+**Task:** create a ClusterRole `deploy-deleter` that allows deleting deployments. User jane can delete deployments in **all** namespaces. User jim can delete deployments **only in `red`**.
+
+```bash
+k create clusterrole deploy-deleter --verb=delete --resource=deployment
+k create clusterrolebinding deploy-deleter --clusterrole=deploy-deleter --user=jane
+k -n red create rolebinding deploy-deleter --clusterrole=deploy-deleter --user=jim
+
+k auth can-i delete deploy --as jane -A             # yes
+k -n red     auth can-i delete deploy --as jim      # yes
+k -n default auth can-i delete deploy --as jim      # no
+```
+
+---
+
+### 6.2 Accounts: ServiceAccounts vs "normal users"
+
+| ServiceAccount | "normal user" |
+|---|---|
+| There **is** a ServiceAccount resource | There is **no** k8s User resource |
+| Managed by the k8s API | Assumed to be managed by a **cluster-independent service** (AWS IAM, GCP, LDAP/OIDC) |
+| Namespaced, has a token | A user is **someone with a cert and key** |
+
+#### Users and certificates
+A client cert is what makes someone a user:
+- The **certificate must be signed by the cluster's CA**.
+- The **username comes from the Common Name**: `/CN=jane`. Groups come from Organization: `/O=dev`.
+
+#### CSR — CertificateSigningRequest flow
+```
+openssl → CSR ──(CertificateSigningRequest)──► API ◄── CA signs
+                                                │
+                     CRT ◄─(CertificateSigningRequest .status.certificate)
+```
+`create KEY → create CSR → API (approve) → download CRT from API → use CRT+KEY`
+
+#### Hands-on 3: Create a certificate + key and authenticate as user jane
+```bash
+# 1. key + CSR (CN = username)
+openssl genrsa -out jane.key 2048
+openssl req -new -key jane.key -out jane.csr          # interactive: only fill "Common Name" = jane
+# non-interactive alternative:
+openssl req -new -key jane.key -out jane.csr -subj "/CN=jane"
+
+# 2. send CSR to the API (template from k8s docs: "CertificateSigningRequest")
+cat jane.csr | base64 -w 0                             # paste into spec.request
+```
+```yaml
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: jane
+spec:
+  request: <base64 of jane.csr, single line>
+  signerName: kubernetes.io/kube-apiserver-client
+  expirationSeconds: 86400            # optional, 1 day
+  usages:
+  - client auth
+```
+```bash
+k apply -f csr.yaml
+k get csr                                             # CONDITION: Pending
+k certificate approve jane                            # → Approved,Issued
+
+# 3. download the signed cert
+k get csr jane -o jsonpath='{.status.certificate}' | base64 -d > jane.crt
+
+# 4. add to kubeconfig
+k config set-credentials jane --client-key=jane.key --client-certificate=jane.crt
+#   → kubeconfig stores PATHS: client-certificate: /root/jane.crt
+k config set-credentials jane --client-key=jane.key --client-certificate=jane.crt --embed-certs
+#   → kubeconfig stores DATA: client-certificate-data: REDACTED (portable)
+k config set-context jane --user=jane --cluster=kubernetes
+k config get-contexts
+k config use-context jane
+k get ns                                              # Forbidden → authenticated, but no RBAC
+k get secrets -n red                                  # works (from Hands-on 1)
+k config use-context kubernetes-admin@kubernetes      # switch back!
+```
+> `k config view` shows certs as `REDACTED`/`DATA+OMITTED`. Use `k config view --raw` to see the actual base64 data.
+
+**Exercise:** now do the same for user **jim**.
+
+#### Leak + invalidation
+- ⚠️ **There is no way to invalidate a certificate.**
+- If a certificate has been leaked:
+  - Remove all access via RBAC.
+  - The username can't be safely used again until the cert expires.
+  - Or create a new CA and re-issue **all** certs.
+- → Use short `expirationSeconds` for user certs.
+
+#### Gotchas (from my lab)
+- `--client-certificate=jane-crt` → `could not stat client-certificate file`. It's a **typo** (`jane.crt`). Always `ls` first.
+- The `openssl req` warning `Can't load /root/.rnd into RNG` is harmless.
+- `spec.request` must be **one line** of base64 (`base64 -w 0`).
+
+#### Section summary
+- Roles / ClusterRoles
+- RoleBinding / ClusterRoleBinding
+- Combining Roles and Bindings
+- "can-i" testing
+- Created user certificate
+- Used CSR k8s API signing
+
+---
+
+### 6.3 Exercise Caution in Using ServiceAccounts
+
+#### Concept
+- Overview
+- Scenarios with SAs and Pods
+- Limit ServiceAccount permissions with RBAC
+
+#### ServiceAccounts and pods
+- **Namespaced.**
+- SA `default` exists in every namespace and is used by pods unless you set another.
+- Can be used to talk to the k8s API.
+- Token: since 1.24 it's a **projected, short-lived token**. No Secret is auto-created anymore. Create one manually with `k create token <sa>`.
+
+#### Hands-on 1: Use a ServiceAccount token to connect to the API from inside a pod
+```bash
+k create sa accessor
+k create token accessor                               # short-lived token (default 1h)
+k run accessor --image=nginx -o yaml --dry-run=client > pod.yaml
+# add spec.serviceAccountName: accessor   (SA must exist, else: error looking up service account default/test)
+k -f pod.yaml create
+k exec -it accessor -- bash
+```
+Inside the pod:
+```bash
+mount | grep ser                   # tmpfs on /run/secrets/kubernetes.io/serviceaccount (ro)
+cd /run/secrets/kubernetes.io/serviceaccount && ls        # ca.crt  namespace  token
+cat namespace                      # default
+cat token                          # JWT → decode at jwt.io to see SA name, ns, expiry
+env | grep KUBER                   # KUBERNETES_SERVICE_HOST=10.96.0.1, PORT=443
+
+curl https://10.96.0.1                                         # (60) SSL cert problem → CA unknown
+curl https://10.96.0.1 -k                                      # 403 User "system:anonymous" cannot get path "/"
+curl https://10.96.0.1 -k -H "Authorization: Bearer $(cat token)"   # 403 User "system:serviceaccount:default:accessor"
+curl --cacert ca.crt https://kubernetes.default -H "Authorization: Bearer $(cat token)"   # proper TLS verify
+```
+> Key insight: **any pod can read its SA token and talk to the API**. Who you are depends on the token. RBAC decides what you can do.
+
+#### Hands-on 2: Disable the ServiceAccount token mount
+Ask yourself: **does my pod need to talk to the Kubernetes API?** If not, don't mount the token.
+
+```yaml
+# on the ServiceAccount (affects all pods using it)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: build-robot
+automountServiceAccountToken: false
+---
+# on the Pod (takes PRECEDENCE over the SA setting)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+spec:
+  serviceAccountName: build-robot
+  automountServiceAccountToken: false
+```
+```bash
+k exec accessor -- mount | grep ser        # nothing → token not mounted
+```
+Docs: kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/
+
+#### Hands-on 3: Limit ServiceAccount permissions using RBAC
+```bash
+k auth can-i delete secrets --as system:serviceaccount:default:accessor     # no
+k create clusterrolebinding accessor --clusterrole edit --serviceaccount default:accessor
+k auth can-i delete secrets --as system:serviceaccount:default:accessor     # yes
+```
+> Impersonation format for SAs: `--as system:serviceaccount:<namespace>:<sa-name>`
+
+#### POLP — Principle of Least Privilege
+Only allow access to data or information that's necessary for the legitimate purpose.
+- One SA per app; never give workloads the `default` SA with extra rights.
+- Prefer RoleBinding (namespaced) over ClusterRoleBinding.
+- Set `automountServiceAccountToken: false` unless the pod needs it.
+
+#### Section summary
+- SAs are resources with a token (projected, short-lived since 1.24)
+- SAs and pods + mounting
+- Create RBAC with SAs
+
+---
+
+### 6.4 Restrict API Access
+
+#### Concept
+- Authentication → Authorization → Admission
+- Connect to the API in different ways
+- Restrict API access in various ways
+
+#### Request workflow
+```
+Human user / Pod (SA) ──► [1 Authentication]  ──► [2 Authorization]       ──► [3 Admission Control]          ──► etcd
+                           "who are you?"         "are you allowed to         "has the limit of pods
+                                                   create pods?"               been reached?"
+```
+- API requests are always tied to a **normal user**, a **ServiceAccount**, or they're **treated as anonymous**.
+- Every request must authenticate, or it's treated as an anonymous user.
+
+#### Restrictions (checklist)
+1. **Don't allow anonymous access.**
+2. **Close the insecure port.**
+3. **Don't expose the apiserver to the outside.**
+4. **Restrict access from nodes to the API (NodeRestriction).**
+5. Prevent unauthorized access (RBAC).
+6. Prevent pods from accessing the API (`automountServiceAccountToken: false`).
+7. Put the apiserver port behind a firewall / allowed IP ranges (cloud provider).
+
+#### Hands-on 1: Anonymous access
+`kube-apiserver --anonymous-auth=true|false`
+- Since 1.6, anonymous access is **enabled by default**:
+  - if the authorization mode is other than AlwaysAllow,
+  - but ABAC and RBAC require explicit authorization for anonymous.
+
+```bash
+curl https://localhost:6443 -k                        # 403 system:anonymous → anon auth ON, RBAC blocks
+vim /etc/kubernetes/manifests/kube-apiserver.yaml     # add: - --anonymous-auth=false
+curl https://localhost:6443 -k                        # 401 Unauthorized → anon auth OFF
+```
+> ⚠️ The apiserver's own **liveness probe uses anonymous access**. With `--anonymous-auth=false` in older versions the probe failed and the apiserver kept restarting. Newer versions handle this, but watch `crictl ps` after the change. Revert to the default for the following labs.
+
+#### Hands-on 2: Insecure access (⚠️ removed in v1.24)
+In the video: `kube-apiserver --insecure-port=8080`
+- HTTP.
+- The request **bypasses** the authentication and authorization modules.
+- The admission controller still enforces.
+
+> ❌ **On current clusters:** `--insecure-port` was deprecated in 1.20 and **removed in 1.24**. Adding it gives `Error: unknown flag: --insecure-port` and the apiserver won't start. Fix: `sed -i '/--insecure-port/d' /etc/kubernetes/manifests/kube-apiserver.yaml`.
+>
+> Modern equivalent for local unauthenticated HTTP: `kubectl proxy --port 8001 &` then `curl http://localhost:8001/api/v1/namespaces`. It authenticates with your kubeconfig and is localhost only.
+
+#### HTTP / HTTPS access
+```
+kubectl + client cert ──Request──► (https) ──► API Server (server cert)
+         ▲                                            │
+         └──── verifies server cert via CA ◄──────────┘
+API server verifies the client cert via the same CA.
+```
+
+#### Hands-on 3: Send a manual API request
+Take the certs out of the kubeconfig and query the API with curl:
+```bash
+k config view --raw
+k config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > ca
+k config view --raw -o jsonpath='{.users[0].user.client-certificate-data}' | base64 -d > crt
+k config view --raw -o jsonpath='{.users[0].user.client-key-data}' | base64 -d > key
+curl https://<apiserver-ip>:6443                                       # SSL problem
+curl https://<apiserver-ip>:6443 --cacert ca                           # 403 anonymous
+curl https://<apiserver-ip>:6443 --cacert ca --cert crt --key key      # ✅ full API access
+```
+
+#### Hands-on 4: Send an API request from outside
+Make the Kubernetes API reachable from outside and access it with kubectl (copy the kubeconfig).
+```bash
+k edit svc kubernetes                         # type: NodePort (lab only!)
+k get svc kubernetes                          # 443:3xxxx
+# on your laptop: copy kubeconfig, set server: https://<node-public-ip>:<nodeport>
+kubectl get ns --insecure-skip-tls-verify     # fails TLS verify without this flag: the public IP isn't in the cert SANs
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -text | grep -A1 "Subject Alternative"   # check SANs
+```
+> Fix the SAN issue properly with an `/etc/hosts` entry for `kubernetes` → public IP, and use `server: https://kubernetes:<nodeport>`.
+> Revert: `k edit svc kubernetes` → `type: ClusterIP`.
+
+#### Hands-on 5: NodeRestriction admission controller
+`kube-apiserver --enable-admission-plugins=NodeRestriction` (on by default in kubeadm)
+- Limits the Node labels a kubelet can modify.
+- It can only modify **its own** Node and the pods bound to it.
+- Secure workload isolation via labels: nobody can pretend to be a "secure" node and get secure pods scheduled.
+
+**Verify NodeRestriction works:** use the worker node kubelet's kubeconfig to set labels.
+```bash
+# on the WORKER node
+export KUBECONFIG=/etc/kubernetes/kubelet.conf
+k get ns                                                     # Forbidden (kubelet ≠ admin)
+k get node                                                   # works
+k label node cks-master cks/test=yes                         # ❌ Forbidden: not its own node
+k label node cks-worker cks/test=yes                         # ✅ own node, normal label OK
+k label node cks-worker node-restriction.kubernetes.io/test=yes   # ❌ restricted prefix
+unset KUBECONFIG
+```
+> Labels with the prefix `node-restriction.kubernetes.io/` can only be set by admins. Use them for isolation (`nodeSelector`), because a compromised kubelet can't set them on itself.
+
+#### Section summary
+- Outside → API, Pod → API, Node → API
+- Anonymous access
+- Insecure access
+- Certificates
+
+---
+
+### 6.5 Upgrade Kubernetes
+*TODO — next screenshots (4:17:25 — release cycles, version differences of components, upgrade!)*
+
+#### Cross-reference: apiserver config files need a volume mount
+Every new file/dir you point an apiserver flag at needs **flag + volumeMount + hostPath volume**. Applies to `--encryption-provider-config`, `--audit-policy-file`, `--audit-log-path`, `--admission-control-config-file`. Otherwise: `open /etc/kubernetes/...: no such file or directory` in `crictl logs`.
+```yaml
+    volumeMounts:
+    - name: enc
+      mountPath: /etc/kubernetes/enc
+      readOnly: true
+  volumes:
+  - name: enc
+    hostPath:
+      path: /etc/kubernetes/enc
+      type: DirectoryOrCreate
+```
+Debug a broken apiserver: `crictl ps -a | grep apiserver` → `crictl logs <id>`, or `ls /var/log/pods/kube-system_kube-apiserver-*/`.
 
 ## 7. Domain 3 — System Hardening
 *TODO — AppArmor, seccomp, reduce the host OS footprint, IAM*
@@ -1031,6 +1423,14 @@ curl -kv https://<host>:<port>/path --resolve <host>:<port>:<ip>
 kube-bench run --targets master --check <id>
 sha512sum <binary>                       # compare against release checksum
 find /proc/<PID>/root/ | grep <binary>   # reach into a distroless container
+k auth can-i <verb> <resource> --as <user> -n <ns>          # RBAC test
+k auth can-i --list --as system:serviceaccount:<ns>:<sa>    # all SA permissions
+k certificate approve <csr>
+k get csr <name> -o jsonpath='{.status.certificate}' | base64 -d > x.crt
+k config set-credentials <u> --client-key=x.key --client-certificate=x.crt --embed-certs
+k config view --raw
+k create token <sa>
+crictl ps -a | grep apiserver && crictl logs <id>           # broken apiserver
 ```
 
 ### Exam-day reminders
