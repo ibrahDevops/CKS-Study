@@ -52,7 +52,8 @@
    - [6.4 Restrict API Access](#64-restrict-api-access)
    - 6.5 Upgrade Kubernetes — *TODO*
 7. [Domain 3 — System Hardening](#7-domain-3--system-hardening) — *TODO*
-8. [Domain 4 — Minimize Microservice Vulnerabilities](#8-domain-4--minimize-microservice-vulnerabilities) — *TODO*
+8. [Domain 4 — Minimize Microservice Vulnerabilities](#8-domain-4--minimize-microservice-vulnerabilities)
+   - [8.x etcd Encryption at Rest — Lab Incident & Recovery](#8x-etcd-encryption-at-rest--lab-incident--recovery-from-my-lab-nov-2026)
 9. [Domain 5 — Supply Chain Security](#9-domain-5--supply-chain-security) — *TODO*
 10. [Domain 6 — Monitoring, Logging & Runtime Security](#10-domain-6--monitoring-logging--runtime-security) — *TODO*
 11. [Quick Reference](#11-quick-reference)
@@ -1390,7 +1391,139 @@ Debug a broken apiserver: `crictl ps -a | grep apiserver` → `crictl logs <id>`
 *TODO — AppArmor, seccomp, reduce the host OS footprint, IAM*
 
 ## 8. Domain 4 — Minimize Microservice Vulnerabilities
-*TODO — Pod Security Admission, securityContext, Secrets/etcd encryption, RuntimeClass (gVisor), mTLS/Cilium*
+*TODO — Pod Security Admission, securityContext, RuntimeClass (gVisor), mTLS/Cilium (course chapter "Manage Kubernetes Secrets" at 4:38:59)*
+
+### 8.x etcd Encryption at Rest — Lab Incident & Recovery (from my lab, Nov 2026)
+
+#### Provider rules (memorise these)
+- The **first** provider in the list is used to **write** (encrypt).
+- **All** providers are tried in order to **read** (decrypt).
+- `identity: {}` = plain text. Keep it in the list (last) while existing plain-text data still exists.
+- Never remove an old key until all data has been **rewritten** with the new one.
+- The apiserver reads `enc.yaml` **only at startup**, so restart it after every change.
+- Prefix in etcd: `k8s:enc:aescbc:v1:<keyname>:` = encrypted; readable YAML/protobuf = plain text.
+
+#### Setup (the correct way)
+```bash
+mkdir -p /etc/kubernetes/enc
+head -c 32 /dev/urandom | base64          # → key
+```
+```yaml
+# /etc/kubernetes/enc/enc.yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+- resources:
+  - secrets                 # ← secrets ONLY unless the task says otherwise
+  providers:
+  - aescbc:
+      keys:
+      - name: key1
+        secret: <base64-32-byte-key>
+  - identity: {}            # ← keep: allows reading existing plain-text secrets
+```
+apiserver manifest: **flag + volumeMount + hostPath volume** (missing mount → `open /etc/kubernetes/enc/enc.yaml: no such file or directory`)
+```yaml
+    - --encryption-provider-config=/etc/kubernetes/enc/enc.yaml
+    volumeMounts:
+    - name: enc
+      mountPath: /etc/kubernetes/enc
+      readOnly: true
+  volumes:
+  - name: enc
+    hostPath:
+      path: /etc/kubernetes/enc
+      type: DirectoryOrCreate
+```
+```bash
+# encrypt all existing secrets + verify
+k get secrets -A -o json | k replace -f -
+k create secret generic test-enc --from-literal=a=b
+ETCDCTL_API=3 etcdctl --cacert /etc/kubernetes/pki/etcd/ca.crt --cert /etc/kubernetes/pki/apiserver-etcd-client.crt --key /etc/kubernetes/pki/apiserver-etcd-client.key get /registry/secrets/default/test-enc | hexdump -C | head
+# → must show k8s:enc:aescbc:v1:key1
+```
+
+#### What went wrong
+I had `configmaps` in `resources` as well, then changed the config. Configmaps that were written while that rule was active ended up encrypted, and the apiserver later couldn't read them.
+
+**Symptoms:**
+```
+kube-controller-manager  CrashLoopBackOff
+  err="StorageError: corrupt object ... Key: /configmaps/kube-system/kube-apiserver-legacy-service-account-token-tracking
+       ... data from the storage is not transformable revision=0: no matching prefix found"
+apiserver logs:
+  cacher (configmaps): unexpected ListAndWatch error: failed to read one or more configmaps ... (and 17 more)
+new pods (coredns, kube-proxy, weave-net) stuck ContainerCreating:
+  FailedMount ... volume "kube-api-access-xxxx": failed to sync configmap cache: timed out waiting for the condition
+  FailedMount ... volume "kube-proxy": failed to sync configmap cache
+k -n kube-system get cm kube-proxy → InternalError: corrupt object ... no matching prefix found
+```
+**Why the whole cluster broke:** every pod mounts `kube-root-ca.crt` (SA token volume), and kube-proxy needs the `kube-proxy` configmap. If even **one** configmap can't be decrypted, the apiserver can't **list** configmaps at all, so every kubelet's configmap watch fails.
+
+`no matching prefix found` = none of the configured providers can decode the stored object. Either:
+1. No `identity: {}` → can't read **plain-text** data, or
+2. The resource was removed from the config / the key changed → can't read **encrypted** data.
+
+> ⚠️ Removing `configmaps` from `enc.yaml` does **not** decrypt anything. It only makes the already-encrypted objects unreadable.
+
+#### The fix that worked: decrypt properly (identity FIRST, old key SECOND)
+```yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+- resources:
+  - secrets
+  providers:
+  - aescbc:
+      keys:
+      - name: key1
+        secret: <your key>
+  - identity: {}
+- resources:
+  - configmaps
+  providers:
+  - identity: {}          # 1st → writes go out as plain text
+  - aescbc:               # 2nd → can still read the encrypted ones
+      keys:
+      - name: key1
+        secret: <same key as before>
+```
+```bash
+# 1. restart apiserver (reload enc.yaml)
+mv /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/ && sleep 20 && mv /tmp/kube-apiserver.yaml /etc/kubernetes/manifests/
+# 2. confirm everything is readable again
+k get cm -A > /dev/null && echo ALL-CM-OK
+# 3. rewrite all configmaps → stored as plain text
+k get cm -A -o json | k replace -f -
+# 4. optional: remove the configmaps block from enc.yaml, restart apiserver again
+# 5. recover workloads
+systemctl restart kubelet                                   # on BOTH nodes
+k -n kube-system delete pod <stuck pods> --force --grace-period=0
+k -n kube-system get pods -w
+```
+> This is also the **official way to disable encryption**: put `identity` first, rewrite, then remove the key.
+
+#### Fallback if the old key is lost
+Delete the unreadable objects directly in etcd (`kubectl delete` fails on corrupt objects):
+```bash
+E="etcdctl --cacert /etc/kubernetes/pki/etcd/ca.crt --cert /etc/kubernetes/pki/apiserver-etcd-client.crt --key /etc/kubernetes/pki/apiserver-etcd-client.key"; for k in $($E get /registry/configmaps --prefix --keys-only); do $E get "$k" --print-value-only </dev/null | grep -aq "k8s:enc:" && echo "$k" && $E del "$k" </dev/null; done
+```
+- `kube-root-ca.crt` (every ns) → recreated automatically by the controller-manager.
+- `kube-proxy` → `kubeadm init phase addon kube-proxy --apiserver-advertise-address=<ip> --pod-network-cidr=<cidr>`
+- `coredns` → `kubeadm init phase addon coredns`
+- Leader-election locks (e.g. `ingress-nginx/ingress-controller-leader`) → just delete them, they get recreated.
+
+> ⚠️ **Script gotcha:** in `etcdctl ... | while read k; do etcdctl get ...; done` the inner `etcdctl` **swallows stdin**, so only the first keys get checked. Use `for k in $(...)` and `</dev/null` on the inner commands, as above.
+
+#### Lessons
+- Encrypt **`secrets` only** unless the task explicitly says otherwise. Encrypting `configmaps` puts every system configmap behind one key.
+- Always keep `identity: {}` and old keys in the list until you've rewritten all the data.
+- Back up `enc.yaml` and the apiserver manifest before every change.
+- Debug order: `crictl ps -a` → `crictl logs <apiserver>` → `k -n kube-system logs kube-apiserver-<node> | grep -i transform` → `k describe pod` events.
+
+#### Related incident: `--anonymous-auth=false` → apiserver restart loop
+The apiserver's startup/liveness/readiness probes (`/livez`, `/readyz`) are **anonymous** HTTPS requests from the kubelet. With `--anonymous-auth=false` they get 401, so the apiserver keeps restarting (`0/1`, restart count climbing), the controller-manager goes into `CrashLoopBackOff`, and pods go `Unknown`.
+Fix: remove the flag (`sed -i '/--anonymous-auth=false/d' /etc/kubernetes/manifests/kube-apiserver.yaml`). To keep anonymous off properly, use an `AuthenticationConfiguration` that allows anonymous **only** for `/livez`, `/readyz` and `/healthz`.
 
 ## 9. Domain 5 — Supply Chain Security
 *TODO — Trivy, kubesec, ImagePolicyWebhook, SBOM, static analysis*
