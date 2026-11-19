@@ -54,6 +54,9 @@
 7. [Domain 3 — System Hardening](#7-domain-3--system-hardening) — *TODO*
 8. [Domain 4 — Minimize Microservice Vulnerabilities](#8-domain-4--minimize-microservice-vulnerabilities)
    - [8.x etcd Encryption at Rest — Lab Incident & Recovery](#8x-etcd-encryption-at-rest--lab-incident--recovery-from-my-lab-nov-2026)
+   - [8.y Container Runtime Sandbox (gVisor) — Lab Incident](#8y-container-runtime-sandbox-gvisor--runtimeclass--lab-incident--recovery-from-my-lab-nov-2026)
+   - [8.z anonymous-auth restart loop](#8z-related-incident---anonymous-authfalse--apiserver-restart-loop)
+12. [Troubleshooting Index](#12-troubleshooting-index)
 9. [Domain 5 — Supply Chain Security](#9-domain-5--supply-chain-security) — *TODO*
 10. [Domain 6 — Monitoring, Logging & Runtime Security](#10-domain-6--monitoring-logging--runtime-security) — *TODO*
 11. [Quick Reference](#11-quick-reference)
@@ -1521,7 +1524,91 @@ E="etcdctl --cacert /etc/kubernetes/pki/etcd/ca.crt --cert /etc/kubernetes/pki/a
 - Back up `enc.yaml` and the apiserver manifest before every change.
 - Debug order: `crictl ps -a` → `crictl logs <apiserver>` → `k -n kube-system logs kube-apiserver-<node> | grep -i transform` → `k describe pod` events.
 
-#### Related incident: `--anonymous-auth=false` → apiserver restart loop
+#### Related incident: anonymous auth — see below
+
+### 8.y Container Runtime Sandbox (gVisor / RuntimeClass) — Lab Incident & Recovery (from my lab, Nov 2026)
+*Course chapter: "Container Runtime Sandboxes" at 5:26:44. Screenshots still to come.*
+
+#### Setup (the correct way)
+```yaml
+# RuntimeClass: handler must match the runtime name in the containerd config
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gvisor
+spec:
+  runtimeClassName: gvisor
+  containers:
+  - name: gvisor
+    image: nginx
+```
+containerd runtime entry (`/etc/containerd/config.toml` on the node that runs the pod):
+```toml
+# containerd 1.x (config version = 2)
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc]
+  runtime_type = "io.containerd.runsc.v1"
+
+# containerd 2.x (config version = 3)
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runsc]
+  runtime_type = "io.containerd.runsc.v1"
+```
+> containerd 2.x converts a version-2 config automatically when it loads it. Check what's actually loaded with `containerd config dump | grep -A2 "runtimes.runsc"`.
+
+#### What went wrong (two errors, in sequence)
+```
+Warning  FailedCreatePodSandBox  kubelet  ... unable to get OCI runtime for sandbox "...": no runtime for "runsc" is configured
+Warning  FailedCreatePodSandBox  kubelet  ... OCI runtime create failed: creating container: cgroups V2 is not yet supported. Enable cgroups V1 and retry
+```
+| Error | Cause | Fix |
+|---|---|---|
+| `no runtime for "runsc" is configured` | containerd doesn't know the runtime: missing `runtimes.runsc` section, or containerd wasn't restarted | Add the section, `systemctl restart containerd` |
+| `cgroups V2 is not yet supported` | **Old runsc binary.** The course install script pins `release-20210806.0`; Ubuntu 24.04 uses cgroup v2 | **Upgrade gVisor**, don't switch to cgroup v1 (new kubelets refuse to run on cgroup v1) |
+
+#### The fix that worked (on the worker)
+```bash
+runsc --version; which -a runsc containerd-shim-runsc-v1
+# → release-20210806.0, both in /usr/local/bin  (old, from the course script)
+
+# install current gVisor from the official apt repo
+curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" > /etc/apt/sources.list.d/gvisor.list
+apt-get update && apt-get install -y runsc            # → 20261116.0, installs to /usr/bin
+
+# remove the old binaries (they come first in PATH)
+rm -f /usr/local/bin/runsc /usr/local/bin/containerd-shim-runsc-v1
+hash -r                                                # ← bash cached the old path!
+runsc --version && which runsc containerd-shim-runsc-v1
+
+containerd --version                                   # v2.4.2
+containerd config dump | grep -A2 "runtimes.runsc"
+systemctl restart containerd
+```
+On the master:
+```bash
+k delete pod gvisor --force --grace-period=0 && k apply -f gvisor-pod.yaml
+k get pod gvisor -w
+k exec gvisor -- dmesg | head -3        # → "Starting gVisor..."  = sandboxed ✅
+k exec gvisor -- uname -r               # gVisor's fake kernel version, not the node's
+```
+
+#### Gotchas
+- `-bash: /usr/local/bin/runsc: No such file or directory` after deleting the old binary: bash **caches command paths**. Fix: `hash -r`.
+- The shim `containerd-shim-runsc-v1` must be in containerd's PATH, next to `runsc`. Upgrade or remove **both** together.
+- The RuntimeClass `handler` name must **exactly** match the `runtimes.<name>` key in the containerd config.
+- The pod only works on nodes where runsc is installed. Use a `nodeSelector` / RuntimeClass `scheduling.nodeSelector` if not every node has it.
+
+#### Debug order
+`k describe pod` (sandbox events) → `runsc --version` / `which -a runsc` on the node → `containerd config dump | grep runsc` → `journalctl -u containerd -n 30` → `systemctl restart containerd`.
+
+---
+
+### 8.z Related incident: `--anonymous-auth=false` → apiserver restart loop
 The apiserver's startup/liveness/readiness probes (`/livez`, `/readyz`) are **anonymous** HTTPS requests from the kubelet. With `--anonymous-auth=false` they get 401, so the apiserver keeps restarting (`0/1`, restart count climbing), the controller-manager goes into `CrashLoopBackOff`, and pods go `Unknown`.
 Fix: remove the flag (`sed -i '/--anonymous-auth=false/d' /etc/kubernetes/manifests/kube-apiserver.yaml`). To keep anonymous off properly, use an `AuthenticationConfiguration` that allows anonymous **only** for `/livez`, `/readyz` and `/healthz`.
 
@@ -1570,3 +1657,27 @@ crictl ps -a | grep apiserver && crictl logs <id>           # broken apiserver
 - After editing a static pod manifest, wait for the apiserver to come back: `watch crictl ps`.
 - Back up manifests before editing: `cp /etc/kubernetes/manifests/kube-apiserver.yaml ~/`.
 - NetworkPolicy: test **both directions** and remember the **DNS egress** exception.
+
+---
+
+## 12. Troubleshooting Index
+Quick lookup: **error message → section**. Every entry comes from my own lab.
+
+| Error / symptom | Cause | Section |
+|---|---|---|
+| `syntax error near unexpected token 'newline'` / `<!DOCTYPE html>` | `github.com/.../blob/` URL instead of `raw.githubusercontent.com` | 2.2 |
+| Dashboard/NodePort unreachable | Private IP, security group, or HTTP vs HTTPS | 5.2 |
+| `curl: (6) Could not resolve host` with `--resolve` | Host/port typo, or HTTP NodePort used for HTTPS | 5.3 |
+| `CN=Kubernetes Ingress Controller Fake Certificate` | TLS secret name/ns wrong, or host mismatch | 5.3 |
+| `could not stat client-certificate file jane-crt` | Filename typo (`jane.crt`) | 6.2 |
+| `Error: unknown flag: --insecure-port` | Flag removed in 1.24 | 6.4 |
+| apiserver `open /etc/kubernetes/enc/enc.yaml: no such file or directory` | Missing volumeMount/hostPath | 6.5, 8.x |
+| apiserver `0/1`, restart count climbing; controller-manager CrashLoopBackOff; pods `Unknown` | `--anonymous-auth=false` breaks the probes | 8.z |
+| `corrupt object ... no matching prefix found` | Encryption config can't decrypt stored data | 8.x |
+| `failed to sync configmap cache: timed out waiting for the condition` | Apiserver can't list configmaps (encryption) / broken kubelet watch | 8.x |
+| `no runtime for "runsc" is configured` | Missing containerd runtime entry | 8.y |
+| `cgroups V2 is not yet supported` | Old gVisor binary | 8.y |
+| `-bash: /usr/local/bin/runsc: No such file or directory` | bash path cache → `hash -r` | 8.y |
+
+**General debug order for a broken control plane:**
+`crictl ps -a` → `crictl logs <id>` → `k -n kube-system logs <pod>` → `k describe pod` events → `journalctl -u kubelet` / `-u containerd` → `systemctl restart kubelet` on all nodes → force-delete stuck `Unknown` pods.
