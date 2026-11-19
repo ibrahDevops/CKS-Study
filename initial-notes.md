@@ -27,7 +27,10 @@
 | 14 | Cluster Hardening – RBAC | 2:59:32 | Cluster Hardening | ✅ |
 | 15 | Cluster Hardening – Exercise caution in using ServiceAccounts | 3:31:26 | Cluster Hardening | ✅ |
 | 16 | Cluster Hardening – Restrict API Access | 3:49:06 | Cluster Hardening | ✅ |
-| 17 | Cluster Hardening – Upgrade Kubernetes | 4:17:25 | Cluster Hardening | ⏳ |
+| 17 | Cluster Hardening – Upgrade Kubernetes | 4:17:25 | Cluster Hardening | ✅ |
+| 18 | Microservice Vulnerabilities – Manage Kubernetes Secrets | 4:38:59 | Microservice Vulnerabilities | ✅ |
+| 19 | Microservice Vulnerabilities – Container Runtime Sandboxes | 5:26:44 | Microservice Vulnerabilities | ✅ |
+| 20 | Microservice Vulnerabilities – OS Level Security Domains | 5:55:xx | Microservice Vulnerabilities | ⏳ |
 
 ---
 
@@ -50,9 +53,11 @@
    - [6.2 Accounts: ServiceAccounts vs users](#62-accounts-serviceaccounts-vs-normal-users)
    - [6.3 Exercise Caution in Using ServiceAccounts](#63-exercise-caution-in-using-serviceaccounts)
    - [6.4 Restrict API Access](#64-restrict-api-access)
-   - 6.5 Upgrade Kubernetes — *TODO*
+   - [6.5 Upgrade Kubernetes](#65-upgrade-kubernetes-update-frequently)
 7. [Domain 3 — System Hardening](#7-domain-3--system-hardening) — *TODO*
 8. [Domain 4 — Minimize Microservice Vulnerabilities](#8-domain-4--minimize-microservice-vulnerabilities)
+   - [8.1 Manage Kubernetes Secrets](#81-manage-kubernetes-secrets)
+   - [8.2 Container Runtime Sandboxes](#82-container-runtime-sandboxes)
    - [8.x etcd Encryption at Rest — Lab Incident & Recovery](#8x-etcd-encryption-at-rest--lab-incident--recovery-from-my-lab-nov-2026)
    - [8.y Container Runtime Sandbox (gVisor) — Lab Incident](#8y-container-runtime-sandbox-gvisor--runtimeclass--lab-incident--recovery-from-my-lab-nov-2026)
    - [8.z anonymous-auth restart loop](#8z-related-incident---anonymous-authfalse--apiserver-restart-loop)
@@ -1362,6 +1367,14 @@ k label node cks-worker cks/test=yes                         # ✅ own node, nor
 k label node cks-worker node-restriction.kubernetes.io/test=yes   # ❌ restricted prefix
 unset KUBECONFIG
 ```
+Real output from the video:
+```
+Error from server (Forbidden): namespaces is forbidden: User "system:node:cks-worker" cannot list resource "namespaces" ... at the cluster scope
+Error from server (Forbidden): nodes "cks-master" is forbidden: node "cks-worker" is not allowed to modify node "cks-master"
+node/cks-worker labeled
+Error from server (Forbidden): nodes "cks-worker" is forbidden: is not allowed to modify labels: node-restriction.kubernetes.io/test
+```
+> The kubelet's identity is `system:node:<nodename>` (group `system:nodes`). The **Node authorizer** (`--authorization-mode=Node,...`) limits what it can read, and the **NodeRestriction admission plugin** limits what it can write.
 > Labels with the prefix `node-restriction.kubernetes.io/` can only be set by admins. Use them for isolation (`nodeSelector`), because a compromised kubelet can't set them on itself.
 
 #### Section summary
@@ -1372,8 +1385,86 @@ unset KUBECONFIG
 
 ---
 
-### 6.5 Upgrade Kubernetes
-*TODO — next screenshots (4:17:25 — release cycles, version differences of components, upgrade!)*
+### 6.5 Upgrade Kubernetes (Update Frequently)
+
+#### Concept
+- Release cycles
+- Version differences of components
+- Upgrade!
+
+#### Why upgrade frequently?
+- Support
+- Security fixes
+- Bug fixes
+- Stay up to date for dependencies
+
+#### Kubernetes release cycles
+- Versioning: `major.minor.patch` → e.g. `1.19.2` = major 1, minor 19, patch 2.
+- A new **minor version roughly every 3–4 months** (3 a year).
+- **No LTS** (Long Term Support).
+- **Support:** maintenance release branches for the **most recent three minor releases** (video: 1.19, 1.18, 1.17). Applicable fixes, including security fixes, may be backported to those three branches, depending on severity and feasibility.
+- → If you're more than 3 minors behind, you get **no security patches**.
+
+#### How to upgrade a cluster
+- **First upgrade the master components:** apiserver, controller-manager, scheduler.
+- **Then the worker components:** kubelet, kube-proxy.
+- **Rule of thumb:** components may be the **same minor version as the apiserver or one below**. Never newer than the apiserver.
+- Only upgrade **one minor version at a time** (1.36 → 1.37, not 1.35 → 1.37).
+
+#### How to upgrade a node
+1. `kubectl drain`
+   - Safely evicts all pods from the node.
+   - Marks the node as SchedulingDisabled (`kubectl cordon`).
+2. Do the upgrade.
+3. `kubectl uncordon`
+   - Unmarks the node as SchedulingDisabled.
+
+#### How to make your application survive an upgrade
+- Pod `terminationGracePeriodSeconds` / Terminating state
+- Pod lifecycle events (`preStop` hook)
+- `PodDisruptionBudget` (limits how many pods drain can evict at once)
+
+#### Hands-on 1: Create an outdated cluster
+Install an earlier version of k8s in the cluster:
+- Use the Killercoda playground (even just a patch upgrade like `1.25.2 → 1.25.3`), or
+- Create new VMs with the previous install scripts, or
+- Install the previous scripts over existing VMs.
+
+#### Hands-on 2: Upgrade the control plane to one minor version up (kubeadm)
+```bash
+# ── control plane node ──
+kubectl get node                                     # current versions
+k drain cks-master --ignore-daemonsets
+# point apt at the NEW minor repo (pkgs.k8s.io is per-minor!)
+sed -i 's/v1.36/v1.37/' /etc/apt/sources.list.d/kubernetes.list && apt-get update
+apt-cache madison kubeadm | head                     # list available versions
+apt-mark unhold kubeadm && apt-get install -y kubeadm=1.37.1-1.1 && apt-mark hold kubeadm
+kubeadm version
+kubeadm upgrade plan                                 # shows what will be upgraded + target version
+kubeadm upgrade apply v1.37.1                        # upgrades apiserver/cm/scheduler/etcd/coredns/kube-proxy
+apt-mark unhold kubelet kubectl && apt-get install -y kubelet=1.37.1-1.1 kubectl=1.37.1-1.1 && apt-mark hold kubelet kubectl
+systemctl daemon-reload && systemctl restart kubelet
+k uncordon cks-master
+
+# ── worker node ──
+k drain cks-worker --ignore-daemonsets               # (run on master)
+# on the worker:
+sed -i 's/v1.36/v1.37/' /etc/apt/sources.list.d/kubernetes.list && apt-get update
+apt-mark unhold kubeadm && apt-get install -y kubeadm=1.37.1-1.1 && apt-mark hold kubeadm
+kubeadm upgrade node                                 # ← worker uses "upgrade node", not "apply"
+apt-mark unhold kubelet kubectl && apt-get install -y kubelet=1.37.1-1.1 kubectl=1.37.1-1.1 && apt-mark hold kubelet kubectl
+systemctl daemon-reload && systemctl restart kubelet
+k uncordon cks-worker                                # (run on master)
+k get node                                           # both on new version
+```
+> ⚠️ Since 2023 the k8s apt repo (`pkgs.k8s.io`) is **one repo per minor version**. If `apt-cache madison kubeadm` doesn't show the new minor, update the URL in `/etc/apt/sources.list.d/kubernetes.list` first. (My worker already has both v1.36 and v1.37 repos listed.)
+> Version strings look like `1.37.1-1.1`. Copy them from `apt-cache madison`.
+
+#### Section summary
+- Why upgrade frequently
+- K8s release cycles
+- Version differences
+- How to upgrade a cluster
 
 #### Cross-reference: apiserver config files need a volume mount
 Every new file/dir you point an apiserver flag at needs **flag + volumeMount + hostPath volume**. Applies to `--encryption-provider-config`, `--audit-policy-file`, `--audit-log-path`, `--admission-control-config-file`. Otherwise: `open /etc/kubernetes/...: no such file or directory` in `crictl logs`.
@@ -1394,7 +1485,321 @@ Debug a broken apiserver: `crictl ps -a | grep apiserver` → `crictl logs <id>`
 *TODO — AppArmor, seccomp, reduce the host OS footprint, IAM*
 
 ## 8. Domain 4 — Minimize Microservice Vulnerabilities
-*TODO — Pod Security Admission, securityContext, RuntimeClass (gVisor), mTLS/Cilium (course chapter "Manage Kubernetes Secrets" at 4:38:59)*
+*Still TODO: Pod Security Admission, securityContext, mTLS/Cilium*
+
+### 8.1 Manage Kubernetes Secrets
+
+#### Concept
+- Overview
+- Create Secure Secret scenario
+- Hack some Secrets 😈
+
+#### Introduction to K8s Secrets
+```
+CODE   ──► git ──► API server ──► kubelet ──► Application POD
+SECRET ──────────► API server ──► kubelet ──► Application POD
+```
+- Code goes through git/CI. **Secrets must not**: they go to the API server separately, and the kubelet injects them into the pod at runtime.
+- Secret = a small amount of sensitive data (password, token, key). Decoupled from the pod spec and image.
+
+#### Simple Secret scenario (hands-on)
+`secret1` → **mounted as a file**, `secret2` → **env var**, both used in one pod.
+```bash
+k create secret generic secret1 --from-literal user=admin
+k create secret generic secret2 --from-literal pass=12345678
+k run pod --image=nginx -o yaml --dry-run=client > pod.yaml
+```
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod
+spec:
+  containers:
+  - name: pod
+    image: nginx
+    env:
+    - name: PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: secret2
+          key: pass
+    volumeMounts:
+    - name: secret1
+      mountPath: /etc/secret1
+      readOnly: true
+  volumes:
+  - name: secret1
+    secret:
+      secretName: secret1
+```
+```bash
+k -f pod.yaml create
+k exec pod -- env | grep PASSWORD          # 12345678
+k exec pod -- mount | grep secret1         # tmpfs on /etc/secret1 (ro)
+k exec pod -- cat /etc/secret1/user        # admin
+```
+Shortcut: `k set env pod/<name> --from=secret/secret2 --dry-run=client -o yaml`
+
+#### Hack 1: Secrets via the container runtime (node access)
+Anyone with **root on the node** can read every secret used by pods on that node, **without any k8s permissions**.
+
+*Diagram: NODE (kubelet + containerd) ↔ CONTROLPLANE (API server ↔ etcd with secret1, secret2)*
+
+```bash
+# on the worker node
+crictl ps | grep pod                              # container id, e.g. bf4ba44613d63
+crictl inspect bf4ba44613d63 | vim -              # full container config as JSON
+```
+In the `crictl inspect` output you can find:
+- **env vars** → `PASSWORD=12345678` (secret2 in plain text!)
+- **mounts** → `"containerPath": "/etc/secret1"`, `"hostPath": "/var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~secret/secret1"`
+- the SA token mount `/var/run/secrets/kubernetes.io/serviceaccount` → `.../kubernetes.io~projected/kube-api-access-xxxx`
+- `"info": { "pid": 9467, "runtimeType": "io.containerd.runc.v2", ... }`
+
+Read the mounted secret through `/proc`:
+```bash
+ps aux | grep 9467                                # nginx: master process
+ls /proc/9467/root/                               # container's root filesystem
+find /proc/9467/root/etc/secret1
+cat /proc/9467/root/etc/secret1/user              # admin
+# or directly from the kubelet volume dir:
+cat /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~secret/secret1/user
+```
+> In the video this is shown with Docker (`docker inspect`). With containerd, use `crictl inspect`. Same idea.
+
+#### Hack 2: Secrets via etcd (control plane access)
+Secrets are stored **unencrypted (just base64) in etcd by default**. Anyone with etcd access can read them all.
+
+*Diagram: KUBELET + docker (WORKER) ↔ API SERVER ↔ etcd with secret1, secret2 (MASTER)*
+
+```bash
+# etcdctl needs the apiserver's etcd client certs (find them in the apiserver manifest)
+grep etcd /etc/kubernetes/manifests/kube-apiserver.yaml
+ETCDCTL_API=3 etcdctl --cert /etc/kubernetes/pki/apiserver-etcd-client.crt --key /etc/kubernetes/pki/apiserver-etcd-client.key --cacert /etc/kubernetes/pki/etcd/ca.crt endpoint health
+ETCDCTL_API=3 etcdctl --cert /etc/kubernetes/pki/apiserver-etcd-client.crt --key /etc/kubernetes/pki/apiserver-etcd-client.key --cacert /etc/kubernetes/pki/etcd/ca.crt get /registry/secrets/default/secret2
+# → value 12345678 readable in plain text
+```
+Key path format: `/registry/<resource>/<namespace>/<name>`
+
+#### Encrypt etcd: EncryptionConfiguration
+*Diagram: API SERVER encrypts/decrypts → etcd stores only ciphertext (MASTER).*
+The apiserver encrypts before writing to etcd. Flag: `--encryption-provider-config`
+
+```yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+- resources:
+  - secrets
+  providers:
+  - identity: {}
+  - aesgcm:
+      keys:
+      - name: key1
+        secret: c2VjcmV0IGlzIHNlY3VyZQ==
+      - name: key2
+        secret: dGhpcyBpcyBwYXNzd29yZA==
+  - aescbc:
+      keys:
+      - name: key1
+        secret: c2VjcmV0IGlzIHNlY3VyZQ==
+      - name: key2
+        secret: dGhpcyBpcyBwYXNzd29yZA==
+```
+**In order!** The **first provider is used for encryption on save.** All providers are tried in order when reading.
+- `identity` first (as above) → new secrets are saved **unencrypted**, but encrypted ones can still be read.
+
+| Goal | Provider order | Then |
+|---|---|---|
+| **Encrypt all secrets** | `aesgcm`/`aescbc` first, `identity: {}` last | `kubectl get secrets --all-namespaces -o json \| kubectl replace -f -` |
+| **Decrypt all secrets** | `identity: {}` first, `aescbc` (old key) after | same `replace` command |
+
+#### Hands-on: Encrypt Secrets in etcd at rest and test it
+Encrypt all existing secrets using **aescbc** and a password of our choice.
+```bash
+mkdir -p /etc/kubernetes/etcd
+echo -n passwordpassword | base64          # 16 chars → valid key (16, 24 or 32 bytes)
+# better: head -c 32 /dev/urandom | base64
+```
+```yaml
+# /etc/kubernetes/etcd/ec.yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+- resources:
+  - secrets
+  providers:
+  - aescbc:
+      keys:
+      - name: key1
+        secret: cGFzc3dvcmRwYXNzd29yZA==
+  - identity: {}
+```
+apiserver manifest: flag `--encryption-provider-config=/etc/kubernetes/etcd/ec.yaml` **+ volumeMount + hostPath volume** (see 8.x).
+```bash
+k create secret generic very-secure --from-literal cc=1234
+ETCDCTL_API=3 etcdctl <certs> get /registry/secrets/default/very-secure      # → k8s:enc:aescbc:v1:key1:...  (ciphertext)
+k get secret very-secure -o yaml                                             # still readable via API ✅
+k get secrets -A -o json | k replace -f -                                    # encrypt all existing ones
+```
+
+#### Video troubleshooting: apiserver won't start after adding the config
+```bash
+ps aux | grep apiserver                    # nothing → apiserver not running
+cd /var/log/pods/ && ls                    # kube-system_kube-apiserver-cks-master_<uid>/
+tail -f kube-system_kube-apiserver-cks-master_<uid>/kube-apiserver/2.log
+```
+```
+Error: error while parsing encryption provider configuration file "/etc/kubernetes/etcd/ec.yaml":
+resources[0].providers[0].aescbc.keys[0].secret: Invalid value: "REDACTED":
+secret is not of the expected length, got 8, expected one of [16 24 32]
+```
+> **aescbc/aesgcm keys must decode to 16, 24 or 32 bytes.** `echo -n password | base64` = 8 bytes → invalid. Use `passwordpassword` (16) or `head -c 32 /dev/urandom | base64`.
+> When the apiserver is down, kubectl is useless. Use `/var/log/pods/` or `crictl logs`.
+
+#### K8s Secret risks (from the k8s docs)
+- Secret data is stored in **etcd**, so:
+  - Admins should enable **encryption at rest** (v1.13+).
+  - Admins should **limit access to etcd** to admin users.
+  - Admins may want to wipe/shred disks used by etcd when they're no longer in use.
+  - With etcd in a cluster, use **TLS for etcd peer-to-peer** communication.
+- A secret in a manifest (JSON/YAML) is only **base64**. Sharing it or checking it into a repo = compromised. **Base64 is not encryption.**
+- Applications still need to protect the value after reading it (don't log it, don't send it to untrusted parties).
+- Anyone who can **create a pod** in a namespace can mount (and read) any secret in that namespace.
+- Root on a node = all secrets used by pods on that node (Hack 1).
+
+#### Why do we even have ConfigMaps and Secrets?
+- **ConfigMaps should stay as they are** (non-sensitive config). ⚠️ Don't encrypt them; see my incident in 8.x.
+- **For Secrets, more secure ways can be implemented:**
+  - Encryption at rest with a **KMS provider** (external key management, e.g. HashiCorp Vault, AWS KMS, Azure Key Vault):
+```yaml
+providers:
+- kms:
+    name: myKmsPlugin
+    endpoint: unix:///tmp/socketfile.sock
+    cachesize: 100
+    timeout: 3s
+- identity: {}
+```
+  - External secret stores: HashiCorp Vault, External Secrets Operator, Secrets Store CSI driver.
+
+#### Section summary
+- What are Secrets?
+- Deploying and using Secrets
+- Hacking Secrets (etcd and docker/containerd)
+- How Secrets are stored (encrypted)
+
+*"How secret are your most secret secrets?"*
+
+---
+
+### 8.2 Container Runtime Sandboxes
+
+#### Concept
+- Technical overview
+- Break out of a container
+- gVisor and Kata Containers
+- OCI and containerd
+
+#### "Containers are not contained"
+Just because it runs in a container doesn't mean it's more protected.
+
+#### Technical overview: containers / Docker
+```
+[App1 Process]   [App2 Process]   [App3 Process]
+ KERNEL GROUP     KERNEL GROUP     KERNEL GROUP
+════════════════════ Kernel ═══════════════════  ← SHARED
+              OPERATING SYSTEM
+```
+- All containers share **one host kernel**. A process that exploits a kernel bug from App1 can reach App2 (red arrows in the slide).
+
+#### Technical overview: sandbox
+Sandbox?
+- Playground when implementing an API
+- Simulated testing environment
+- Development server
+- **Security layer to reduce attack surface** ← the CKS meaning
+
+#### Containers and system calls
+```
+User Space    [App1] [App2]
+              [SANDBOX] [SANDBOX]   ← sandbox for every container
+              [System Calls]
+Kernel Space  [Kernel]
+              [Hardware]
+```
+The sandbox sits between the container and the kernel and intercepts/filters syscalls, so the app never talks to the real kernel directly.
+
+#### Sandboxes don't come for free
+- More resources needed
+- Might be better for smaller containers
+- Not good for syscall-heavy workloads
+- No direct access to hardware
+
+#### Hands-on: Why even sandbox? Contact the Linux kernel from inside a container
+```bash
+k run pod --image=nginx
+k exec pod -it -- bash
+uname -r                  # 5.4.0-1028-gcp  ← SAME as the host kernel!
+exit
+uname -r                  # 5.4.0-1028-gcp (on the node)
+strace uname -r           # shows the syscall: uname({sysname="Linux", ...})
+```
+→ The container calls the **host kernel directly**.
+
+**Dirty Cow** (CVE-2016-5195): a Linux kernel privilege-escalation bug. Exploitable **from inside a container** because the kernel is shared → container breakout to root on the host. That's why sandboxes exist.
+
+#### OCI — Open Container Initiative
+- Linux Foundation project to design **open standards** for virtualization.
+- **Specification:** runtime, image, distribution.
+- **Runtime:** `runc` (the container runtime that implements their spec).
+
+```
+dockerInc/docker ─use─► moby/moby ─use─► containerd/containerd ─use─► oci/runc ─► oci/runc/libcontainer
+                                                                         ▲
+                                           oci/runtime-spec ──impl──────┘
+```
+- Kubernetes (kubelet) → **CRI** → containerd → **OCI runtime** (`runc` by default, or `runsc` / `kata-runtime`).
+- Because of these standards, you can swap `runc` for a sandboxed runtime **per pod**.
+
+#### Sandbox runtimes
+| | **gVisor** (`runsc`, Google) | **Kata Containers** |
+|---|---|---|
+| How | **User-space kernel** written in Go. Intercepts syscalls and implements them itself | Each container runs in its **own lightweight VM** (own kernel, hypervisor) |
+| Isolation | Strong (limited syscalls reach the host) | Strongest (hardware virtualization) |
+| Needs | Nothing special | Nested virtualization / KVM, so often not possible on cloud VMs |
+| Overhead | Syscall-heavy apps are slower | VM boot and memory overhead |
+
+#### Hands-on: RuntimeClasses
+Create and use a RuntimeClass for runtime `runsc` (gVisor).
+
+*Installation of gVisor/runsc with containerd:* Worker node → KUBELET → containerd → `runc` (default) **or** `runsc (gvisor)`.
+
+```yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc            # must match the runtime name in the containerd config
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gvisor
+spec:
+  runtimeClassName: gvisor
+  containers:
+  - name: gvisor
+    image: nginx
+```
+```bash
+k get runtimeclass
+k exec gvisor -- dmesg | head -3       # "Starting gVisor..." → sandboxed
+k exec gvisor -- uname -r              # fake gVisor kernel, ≠ node kernel
+```
+Install and troubleshooting on my cluster (old runsc, cgroups v2, `hash -r`) → see **8.y** below.
+
 
 ### 8.x etcd Encryption at Rest — Lab Incident & Recovery (from my lab, Nov 2026)
 
@@ -1567,6 +1972,8 @@ Warning  FailedCreatePodSandBox  kubelet  ... OCI runtime create failed: creatin
 ```
 | Error | Cause | Fix |
 |---|---|---|
+| `secret is not of the expected length, got 8, expected one of [16 24 32]` | aescbc key too short | 8.1 |
+| apiserver down, kubectl useless | Read `/var/log/pods/kube-system_kube-apiserver-*/` or `crictl logs` | 8.1 |
 | `no runtime for "runsc" is configured` | containerd doesn't know the runtime: missing `runtimes.runsc` section, or containerd wasn't restarted | Add the section, `systemctl restart containerd` |
 | `cgroups V2 is not yet supported` | **Old runsc binary.** The course install script pins `release-20210806.0`; Ubuntu 24.04 uses cgroup v2 | **Upgrade gVisor**, don't switch to cgroup v1 (new kubelets refuse to run on cgroup v1) |
 
@@ -1651,6 +2058,12 @@ k config set-credentials <u> --client-key=x.key --client-certificate=x.crt --emb
 k config view --raw
 k create token <sa>
 crictl ps -a | grep apiserver && crictl logs <id>           # broken apiserver
+crictl inspect <id>                                         # env vars, mounts, pid of a container
+cat /proc/<pid>/root/<path>                                 # read files inside a container from the node
+ETCDCTL_API=3 etcdctl --cert ... --key ... --cacert ... get /registry/secrets/<ns>/<name>
+k get secrets -A -o json | k replace -f -                   # re-encrypt/decrypt all secrets
+kubeadm upgrade plan / kubeadm upgrade apply vX.Y.Z / kubeadm upgrade node
+k drain <node> --ignore-daemonsets && k uncordon <node>
 ```
 
 ### Exam-day reminders
