@@ -33,7 +33,10 @@
 | 20 | Microservice Vulnerabilities – OS Level Security Domains | 5:55:20 | Microservice Vulnerabilities | ✅ |
 | 21 | Microservice Vulnerabilities – mTLS | 6:12:xx | Microservice Vulnerabilities | ✅ |
 | 22 | Open Policy Agent (OPA) | 6:29:xx | Microservice Vulnerabilities | ✅ |
-| 23 | Supply Chain Security – Image Footprint | 7:06:xx | Supply Chain Security | ⏳ |
+| 23 | Supply Chain Security – Image Footprint | 7:06:xx | Supply Chain Security | ✅ |
+| 24 | Supply Chain Security – Static Analysis | 7:28:xx | Supply Chain Security | ✅ |
+| 25 | Supply Chain Security – Image Vulnerability Scanning | 7:52:41 | Supply Chain Security | ✅ |
+| 26 | Supply Chain Security – Secure Supply Chain | 8:09:xx | Supply Chain Security | ⏳ |
 
 ---
 
@@ -70,6 +73,9 @@
 12. [Troubleshooting Index](#12-troubleshooting-index)
 9. [Domain 5 — Supply Chain Security](#9-domain-5--supply-chain-security)
    - [9.1 Image Footprint](#91-image-footprint)
+   - [9.2 Static Analysis (kubesec, conftest)](#92-static-analysis-of-user-workloads)
+   - [9.3 Image Vulnerability Scanning (Trivy)](#93-scan-images-for-known-vulnerabilities)
+   - [9.4 Secure Supply Chain](#94-secure-supply-chain)
 10. [Domain 6 — Monitoring, Logging & Runtime Security](#10-domain-6--monitoring-logging--runtime-security) — *TODO*
 11. [Quick Reference](#11-quick-reference)
 
@@ -2177,6 +2183,15 @@ k run pod --image=nginx       # Error from server (Forbidden): admission webhook
 k describe k8salwaysdeny pod-always-deny     # shows "Total Violations" by EXISTING resources (audit)
 ```
 Change the rule to `1 > 2` (never true) → **approve all**: pods can be created again.
+
+His live edit (video uses `templates.gatekeeper.sh/v1beta1`; current Gatekeeper uses `v1`, both work):
+```rego
+violation[{"msg": msg}] {
+  1 > 0 # true
+  1 > 2 # false      ← adding this line makes the whole rule false → no violation → approve all
+  msg := input.parameters.message
+}
+```
 > A Rego rule produces a violation only if **all** lines inside it are true (implicit AND).
 
 #### Hands-on 3: Enforce namespace/pod labels
@@ -2446,10 +2461,106 @@ The apiserver's startup/liveness/readiness probes (`/livez`, `/readyz`) are **an
 Fix: remove the flag (`sed -i '/--anonymous-auth=false/d' /etc/kubernetes/manifests/kube-apiserver.yaml`). To keep anonymous off properly, use an `AuthenticationConfiguration` that allows anonymous **only** for `/livez`, `/readyz` and `/healthz`.
 
 ## 9. Domain 5 — Supply Chain Security
-*Still TODO: Trivy, kubesec, ImagePolicyWebhook, SBOM, static analysis*
+*Still TODO: ImagePolicyWebhook, SBOM, image signing (cosign)*
 
 ### 9.1 Image Footprint
-*Course chapter: "Image footprint" at ~7:06. Screenshots still to come.*
+
+#### Concept
+- Containers and Docker
+- Reduce image footprint (multi-stage)
+- Secure images
+
+#### Containers vs VMs (recap, see 4.1)
+- Containers: app process in a kernel group on the **shared** kernel → *kernel can access app process*.
+- VMs: own kernel + OS → *host cannot access the app process*.
+
+#### Containers and Docker — Layers
+```dockerfile
+FROM ubuntu                                       # ← import layers
+RUN apt-get update && apt-get install -y golang-go   # ← add new layer
+CMD ["sh"]
+```
+> **Only the instructions `RUN`, `COPY`, `ADD` create layers.** Other instructions create temporary intermediate images and do not increase the size of the build.
+
+#### Why reduce the footprint
+```
+Debian      → Base base image ┐
+Nginx       → Base image      │  Size adds up
+install curl → My image        ┘
+```
+Every layer adds size **and** attack surface (more packages = more CVEs, more tools for an attacker).
+
+#### Hands-on 1: Reduce image footprint via multi-stage build
+We look at an example Golang Dockerfile and reduce the footprint via multi-stage build.
+Course files: `cks-course-environment/course-content/supply-chain-security/image-footprint/`
+
+**Before (single stage, his screen):**
+```dockerfile
+FROM ubuntu
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y golang-go
+COPY app.go .
+RUN CGO_ENABLED=0 go build app.go
+CMD ["./app"]
+```
+```bash
+docker build -t app .
+docker run app
+docker image ls | grep app        # ~700 MB (Ubuntu + Go toolchain)
+```
+**After (multi-stage, his screen):**
+```dockerfile
+FROM ubuntu
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y golang-go
+COPY app.go .
+RUN CGO_ENABLED=0 go build app.go
+
+FROM alpine
+COPY --from=0 /app .              # --from=0 = first stage (or name it: FROM ubuntu AS build → --from=build)
+CMD ["./app"]
+```
+```bash
+docker build -t app .
+docker image ls | grep app        # ~7 MB — only alpine + the static binary
+```
+Docs: docs.docker.com → Dockerfile best practices → *Use multi-stage builds*.
+
+#### Hands-on 2: Secure and harden images
+1. **Use specific package versions**
+2. **Don't run as root**
+3. **Make filesystem read-only**
+4. **Remove shell access**
+
+```dockerfile
+FROM ubuntu:20.04
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y golang-go=2:1.13~1ubuntu2      # 1. pinned versions (base image AND packages)
+COPY app.go .
+RUN pwd
+RUN CGO_ENABLED=0 go build app.go
+
+FROM alpine:3.12.0                                                       # 1. pinned base image
+RUN chmod a-w /etc                                                       # 3. read-only (example: /etc)
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup -h /home/appuser   # 2. non-root user
+RUN rm -rf /bin/*                                                        # 4. remove shell + tools (do this LAST)
+COPY --from=0 /app /home/appuser/
+USER appuser                                                             # 2. switch user
+CMD ["/home/appuser/app"]
+```
+```bash
+docker run -d --name app app
+docker exec -it app sh        # OCI runtime exec failed: "sh": executable file not found → shell removed ✅
+docker exec app whoami        # appuser (if whoami still existed)
+```
+> Order matters: `rm -rf /bin/*` must come after every `RUN` that needs a shell.
+> In k8s, enforce the same at runtime: `securityContext.runAsNonRoot`, `readOnlyRootFilesystem: true` (8.3).
+
+#### Section summary
+- Reduce image footprint
+- Use multi stage build
+- Secure images with restrictions
+
 
 #### Lab note: multi-stage build failed on `apt-get` (from my lab, Nov 2026)
 ```
@@ -2473,6 +2584,268 @@ USER appuser
 CMD ["/home/appuser/app"]
 ```
 Same lesson (multi-stage → small image, non-root user) with supported base images. Check with `docker images | grep app`.
+
+### 9.2 Static Analysis of User Workloads
+
+#### Concept
+- Static analysis
+- Manual approach
+- Tools for Kubernetes and scenarios
+
+#### Static analysis
+- Looks at **source code and text files** (k8s YAML, Dockerfiles).
+- Checks against **rules**.
+- Enforces rules.
+
+#### Static analysis rules (examples)
+- "Always define resource requests and limits" → *depends on use case and company or project*.
+- "Pods should never use the default ServiceAccount".
+- **Generally: don't store sensitive data plain in K8s/Docker files** (no passwords in `env:` or `ENV`).
+
+#### Static analysis in CI/CD
+```
+Code → Commit → GitHub → Build → Test → Deploy → K8s
+  ▲        ▲               ▲                       ▲
+  └────────┴─ Static Analysis (kubesec, conftest) ┘
+                                    PSP / OPA (admission) ─┘
+```
+Run it as early as possible (pre-commit, CI). Admission control (PSA/OPA Gatekeeper) is the last line in the cluster.
+
+#### Manual approach
+Read the YAML/Dockerfile yourself: secrets in plain text, `privileged`, `hostPath`, `runAsUser: 0`, `latest` tags, missing limits.
+
+#### Kubesec
+- Security risk analysis for Kubernetes resources.
+- Open source.
+- **Opinionated!** Fixed set of rules (security best practices).
+- Run as: binary, docker container, kubectl plugin, admission controller (kubesec-webhook).
+- Live demo: kubesec.io (hosted API `v2.kubesec.io/scan`).
+
+#### Hands-on 1: Kubesec (my terminal)
+```bash
+k run nginx --image=nginx --dry-run=client -oyaml > nginx.yaml
+docker run -i kubesec/kubesec:512c5e0 scan /dev/stdin < nginx.yaml
+```
+Output (JSON):
+```json
+"object": "Pod/nginx.default",
+"valid": true,
+"message": "Passed with a score of 0 points",
+"score": 0,
+"scoring": { "advise": [
+  { "selector": "containers[] .securityContext .readOnlyRootFilesystem == true",
+    "reason": "An immutable root filesystem can prevent malicious binaries being added to PATH and increase attack cost" },
+  { "selector": "containers[] .securityContext .runAsNonRoot == true",
+    "reason": "Force the running image to run as a non-root user to ensure least privilege" },
+  { "selector": "containers[] .securityContext .runAsUser -gt 10000",
+    "reason": "Run as a high-UID user to avoid conflicts with the host's user table" },
+  { "selector": "containers[] .securityContext .capabilities .drop", ... },
+  { "selector": "containers[] .resources .requests .cpu", ... }
+]}
+```
+- **Score:** positive points for good settings (readOnlyRootFilesystem, runAsNonRoot …), **negative / critical** for dangerous ones (`privileged`, `SYS_ADMIN`, `hostNetwork`) → `"valid": false`.
+- Exam pattern: run kubesec, fix the YAML until the critical findings are gone / score improves.
+- Without docker (containerd nodes): use the binary: `kubesec scan pod.yaml`.
+
+#### Conftest — OPA
+- OPA = Open Policy Agent.
+- **Unit test framework for Kubernetes configurations** (and Dockerfiles, Terraform, any JSON/YAML).
+- Uses **Rego** language. Default package: `main`, rules: `deny[msg]`, `warn[msg]`.
+```rego
+package main
+deny[msg] {
+  input.kind = "Deployment"
+  not input.spec.template.spec.securityContext.runAsNonRoot = true
+  msg = "Containers must not run as root"
+}
+```
+
+#### Hands-on 2: OPA conftest K8s Deployment (his terminal)
+Course files: `course-content/supply-chain-security/static-analysis/conftest/kubernetes/` (`deploy.yaml`, `policy/deployment.rego`, `run.sh`)
+```rego
+# policy/deployment.rego   (from https://www.conftest.dev)
+package main
+
+deny[msg] {
+  input.kind = "Deployment"
+  not input.spec.template.spec.securityContext.runAsNonRoot = true
+  msg = "Containers must not run as root"
+}
+
+deny[msg] {
+  input.kind = "Deployment"
+  not input.spec.selector.matchLabels.app
+  msg = "Containers must provide app label for pod selectors"
+}
+```
+```bash
+git clone https://github.com/killer-sh/cks-course-environment.git
+cd cks-course-environment/course-content/supply-chain-security/static-analysis/conftest/kubernetes
+cat run.sh
+docker run --rm -v $(pwd):/project instrumenta/conftest test deploy.yaml
+# FAIL - deploy.yaml - Containers must not run as root
+# 2 tests, 1 passed, 0 warnings, 1 failure, 0 exceptions
+```
+Fix: add `spec.template.spec.securityContext.runAsNonRoot: true` → re-run → 2 passed.
+
+#### Hands-on 3: OPA conftest Dockerfile (his terminal)
+Course files: `.../conftest/docker/` (`Dockerfile`, `policy/base.rego`, `policy/commands.rego`, `run.sh`)
+```bash
+cd ../docker && ls policy/        # base.rego  commands.rego
+./run.sh
+# FAIL - Dockerfile - unallowed image found ["ubuntu"]
+# FAIL - Dockerfile - unallowed commands found ["apt-get update && apt-get install -y golang-go"]
+# 2 tests, 0 passed, 0 warnings, 2 failures, 0 exceptions
+vim Dockerfile   && ./run.sh     # change base image → 1 passed, 1 failure
+vim policy/commands.rego && ./run.sh     # adjust denylist → 2 tests, 2 passed ✅
+```
+Typical Dockerfile policies (`base.rego` / `commands.rego`):
+```rego
+package main
+denylist = ["ubuntu"]
+deny[msg] {
+  input[i].Cmd == "from"
+  val := input[i].Value
+  contains(val[i], denylist[_])
+  msg = sprintf("unallowed image found %s", [val])
+}
+```
+> ⚠️ `instrumenta/conftest` is the old image name; current: `openpolicyagent/conftest`. Binary: `conftest test <file> -p policy/`.
+
+#### Section summary
+- Static analysis
+- Manual approach
+- Kubesec
+- OPA Conftest
+
+---
+
+### 9.3 Scan Images for Known Vulnerabilities
+
+#### Concept
+- Introduction
+- Vulnerabilities
+- Tools to scan images (Clair, Trivy)
+
+#### Image vulnerabilities
+Webservers or other apps can contain vulnerabilities (buffer overflows).
+| Targets | Results |
+|---|---|
+| Remotely accessible application in container | Privilege escalation |
+| Local application inside container | Information leaks |
+| | DDoS |
+
+#### Containers — Layers — Dependencies
+```
+ubuntu=14  → Layer 1-3
+nginx=x.x  → Layer 4-5
+curl=x.x   → Layer 6
+```
+Every layer/package version can carry known CVEs → pin and update versions.
+
+#### Known image vulnerabilities
+**Databases:**
+- https://cve.mitre.org
+- https://nvd.nist.gov
+
+Vulnerabilities can be discovered in our own image and dependencies:
+- Check during build
+- Check at runtime
+
+#### Where to check
+```
+Code → Commit → GitHub → Build → Test → Deploy → K8s
+  ▲                        ▲                 ▲       ▲
+  └──── Scan for known vulnerabilities ──────┘       │
+                          Enforce registries/images (PSP / OPA) ┘
+```
+**Known image vulnerabilities — admission controllers:**
+`API HTTP handler → AuthN/AuthZ → Mutating admission (→ mutating webhooks) → Object schema validation → Validating admission (→ validating webhooks) → persisted to etcd`
+→ Tools that scan for known vulnerabilities can hook in as **webhooks** (e.g. ImagePolicyWebhook).
+
+#### Clair
+- Open source project.
+- Static analysis of vulnerabilities in application containers.
+- Ingests vulnerability metadata from a configured set of sources.
+- Provides API.
+- Heavier to set up (needs DB + server) → Trivy is the exam tool.
+
+#### Trivy
+- Open source project (Aqua Security).
+- "A Simple and Comprehensive Vulnerability Scanner for Containers and other Artifacts, Suitable for CI."
+- Simple, easy and fast.
+
+#### Hands-on: Use Trivy to check some public images and our kube-apiserver image (his terminal)
+```bash
+docker run ghcr.io/aquasecurity/trivy:latest image nginx
+docker run ghcr.io/aquasecurity/trivy:latest image nginx | grep CRITICAL
+# Total: 148 (UNKNOWN: 0, LOW: 111, MEDIUM: 11, HIGH: 25, CRITICAL: 1)
+# | libbsd0 | CVE-2019-20367 | CRITICAL | 0.9.1-2 | ... nlist.c in libbsd before ...
+docker run ghcr.io/aquasecurity/trivy:latest image nginx:1.16-alpine
+```
+Output table columns: `LIBRARY | VULNERABILITY ID | SEVERITY | INSTALLED VERSION | FIXED VERSION | TITLE`.
+
+**Exam-style usage (trivy binary is usually installed):**
+```bash
+trivy image nginx:1.19                                       # full report
+trivy image --severity HIGH,CRITICAL nginx:1.19              # filter
+trivy image -s CRITICAL -q nginx:1.19 | grep -c CRITICAL     # count, quiet
+trivy image --ignore-unfixed nginx:1.19                      # only fixable CVEs
+# check the kube-apiserver image used in the cluster:
+grep image: /etc/kubernetes/manifests/kube-apiserver.yaml
+trivy image registry.k8s.io/kube-apiserver:v1.37.1
+# typical task: "find all pods whose image has CVE-XXXX / CRITICAL vulns and delete/scale them down"
+k get pod -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{" "}{.spec.containers[*].image}{"\n"}{end}'
+```
+
+#### Section summary
+- Vulnerabilities
+- Dependencies
+- Databases
+- Clair
+- Trivy
+
+---
+
+### 9.4 Secure Supply Chain
+
+#### Concept
+- Supply chain
+- K8s and container registries
+- Validate and whitelist images and registries
+
+#### Software supply chain
+```
+screw + wood → factory → chair → shop → customer
+Tools → Software Development → [ Container → CI/CD Registry → K8s Cloud ] → Browser
+                                └──────── CKS focus ────────┘
+```
+
+#### K8s and container registries — private registry with Kubernetes
+```bash
+# create secret
+kubectl create secret docker-registry my-private-registry \
+  --docker-server=my-private-registry-server \
+  --docker-username=username \
+  --docker-password=password \
+  --docker-email=email
+# add imagePullSecret to the SA → all pods using this SA can pull
+kubectl patch serviceaccount default -p '{"imagePullSecrets": [{"name": "my-private-registry"}]}'
+```
+Or per pod: `spec.imagePullSecrets: [{name: my-private-registry}]`.
+
+#### Use image digest instead of tag (his terminal)
+Tags are mutable (`v1.19.3` can be re-pushed); a **digest** (`@sha256:...`) is immutable.
+```bash
+k -n kube-system get pod kube-apiserver-cks-master -o yaml | grep imageID
+# imageID: k8s.gcr.io/kube-apiserver@sha256:...
+vim /etc/kubernetes/manifests/kube-apiserver.yaml
+#   image: k8s.gcr.io/kube-apiserver:v1.19.3
+# → image: k8s.gcr.io/kube-apiserver@sha256:<digest>
+```
+> Video uses `k8s.gcr.io` (frozen). Current registry: `registry.k8s.io`.
+
+*Next: validate and whitelist images and registries (OPA / ImagePolicyWebhook) — TODO, next screenshots.*
 
 ## 10. Domain 6 — Monitoring, Logging & Runtime Security
 *TODO — Falco, audit logs, immutable containers*
@@ -2518,6 +2891,10 @@ kubeadm upgrade plan / kubeadm upgrade apply vX.Y.Z / kubeadm upgrade node
 k exec <pod> -- cat /proc/1/status | grep -E "NoNewPrivs|CapEff|Seccomp"
 k label ns <ns> pod-security.kubernetes.io/enforce=restricted
 k get constrainttemplates; k get constraints
+docker run -i kubesec/kubesec:512c5e0 scan /dev/stdin < pod.yaml
+docker run --rm -v $(pwd):/project openpolicyagent/conftest test deploy.yaml
+trivy image -s HIGH,CRITICAL <image>
+k create secret docker-registry <name> --docker-server=... --docker-username=... --docker-password=...
 k drain <node> --ignore-daemonsets && k uncordon <node>
 ```
 
@@ -2547,6 +2924,8 @@ Quick lookup: **error message → section**. Every entry comes from my own lab.
 | `container has runAsNonRoot and image will run as root` | `runAsNonRoot: true` without `runAsUser` | 8.3 |
 | `violates PodSecurity "baseline:latest"` | PSA namespace label blocks the pod | 8.3 |
 | `admission webhook "validation.gatekeeper.sh" denied the request` | Gatekeeper constraint violation | 8.5 |
+| `"sh": executable file not found` on `docker exec` | Shell removed in hardened image (intended) | 9.1 |
+| conftest `FAIL - ... unallowed image found` | Rego denylist matched | 9.2 |
 | `apt-get ... Connection failed` during `docker build` | Network drop; retry / regional mirror / golang image | 9.1 |
 | `no runtime for "runsc" is configured` | Missing containerd runtime entry | 8.y |
 | `cgroups V2 is not yet supported` | Old gVisor binary | 8.y |
