@@ -30,7 +30,10 @@
 | 17 | Cluster Hardening – Upgrade Kubernetes | 4:17:25 | Cluster Hardening | ✅ |
 | 18 | Microservice Vulnerabilities – Manage Kubernetes Secrets | 4:38:59 | Microservice Vulnerabilities | ✅ |
 | 19 | Microservice Vulnerabilities – Container Runtime Sandboxes | 5:26:44 | Microservice Vulnerabilities | ✅ |
-| 20 | Microservice Vulnerabilities – OS Level Security Domains | 5:55:xx | Microservice Vulnerabilities | ⏳ |
+| 20 | Microservice Vulnerabilities – OS Level Security Domains | 5:55:20 | Microservice Vulnerabilities | ✅ |
+| 21 | Microservice Vulnerabilities – mTLS | 6:12:xx | Microservice Vulnerabilities | ✅ |
+| 22 | Open Policy Agent (OPA) | 6:29:xx | Microservice Vulnerabilities | ✅ |
+| 23 | Supply Chain Security – Image Footprint | 7:06:xx | Supply Chain Security | ⏳ |
 
 ---
 
@@ -58,11 +61,15 @@
 8. [Domain 4 — Minimize Microservice Vulnerabilities](#8-domain-4--minimize-microservice-vulnerabilities)
    - [8.1 Manage Kubernetes Secrets](#81-manage-kubernetes-secrets)
    - [8.2 Container Runtime Sandboxes](#82-container-runtime-sandboxes)
+   - [8.3 OS Level Security Domains](#83-os-level-security-domains)
+   - [8.4 mTLS](#84-mtls--mutual-tls)
+   - [8.5 OPA Gatekeeper](#85-open-policy-agent-opa--gatekeeper)
    - [8.x etcd Encryption at Rest — Lab Incident & Recovery](#8x-etcd-encryption-at-rest--lab-incident--recovery-from-my-lab-nov-2026)
    - [8.y Container Runtime Sandbox (gVisor) — Lab Incident](#8y-container-runtime-sandbox-gvisor--runtimeclass--lab-incident--recovery-from-my-lab-nov-2026)
    - [8.z anonymous-auth restart loop](#8z-related-incident---anonymous-authfalse--apiserver-restart-loop)
 12. [Troubleshooting Index](#12-troubleshooting-index)
-9. [Domain 5 — Supply Chain Security](#9-domain-5--supply-chain-security) — *TODO*
+9. [Domain 5 — Supply Chain Security](#9-domain-5--supply-chain-security)
+   - [9.1 Image Footprint](#91-image-footprint)
 10. [Domain 6 — Monitoring, Logging & Runtime Security](#10-domain-6--monitoring-logging--runtime-security) — *TODO*
 11. [Quick Reference](#11-quick-reference)
 
@@ -1763,6 +1770,49 @@ dockerInc/docker ─use─► moby/moby ─use─► containerd/containerd ─us
 - Kubernetes (kubelet) → **CRI** → containerd → **OCI runtime** (`runc` by default, or `runsc` / `kata-runtime`).
 - Because of these standards, you can swap `runc` for a sandboxed runtime **per pod**.
 
+#### Kubernetes runtimes and CRI (Container Runtime Interface)
+**Early days:** `kubelet → dockershim → dockerd → containerd → runc`. Kubelet could only talk to Docker. containerd is a CNCF project; runc follows the OCI spec.
+
+**Today, with CRI:** the kubelet talks to **any** CRI-compatible runtime.
+```
+                          kubelet
+   ┌──────────┬──────────┬──────┴─────┬──────────────┐
+dockershim  cri-containerd  cri-o   containerd     singularity-cri
+   │            │            │          │                │
+ dockerd    containerd     runc     Shim API         singularity
+ containerd   runc                 ┌───┼────────┐
+ runc                            Kata Firecracker gVisor
+```
+- Choosing the runtime for the whole node: `kubelet --container-runtime-endpoint` (e.g. `unix:///run/containerd/containerd.sock`).
+- Choosing it **per pod**: **RuntimeClass** (or annotations, in older setups).
+- dockershim was **removed in k8s 1.24**. Docker images still run fine, because they're OCI images.
+
+#### Kata Containers
+- Strong separation layer.
+- Runs **every container in its own private VM** (hypervisor based).
+- **QEMU** as default. It needs virtualisation, like **nested virtualisation in the cloud** (often not available on EC2/GCE).
+```
+[VM: Process A | Namespaces | Linux Kernel A]  [VM: Process B | ... | Kernel B]  [VM: Process C | ... | Kernel C]
+[Hardware Virtualization]                      [Hardware Virtualization]          [Hardware Virtualization]
+══════════════════════════════════ Host Linux Kernel ══════════════════════════════════
+           Additional isolation with a lightweight VM and individual kernels
+```
+
+#### gVisor — user-space kernel for containers
+- Another layer of separation.
+- **NOT** hypervisor/VM based.
+- Simulates kernel syscalls with limited functionality.
+- Runs in userspace, separated from the Linux kernel.
+- Runtime is called **`runsc`**.
+```
+Application
+──── System Calls ────
+gVisor                 ← independent (user-space) kernel
+──── Limited System Calls ────   ← virtualization-based strong isolation
+Host Kernel
+──── Hardware ────
+```
+
 #### Sandbox runtimes
 | | **gVisor** (`runsc`, Google) | **Kata Containers** |
 |---|---|---|
@@ -1799,6 +1849,382 @@ k exec gvisor -- dmesg | head -3       # "Starting gVisor..." → sandboxed
 k exec gvisor -- uname -r              # fake gVisor kernel, ≠ node kernel
 ```
 Install and troubleshooting on my cluster (old runsc, cgroups v2, `hash -r`) → see **8.y** below.
+
+> 💡 containerd shows the runtime per container: `crictl inspect <id> | grep runtimeType` → `io.containerd.runsc.v1` vs `io.containerd.runc.v2`.
+
+#### Section summary
+- Container sandboxes
+- containerd
+- kata-containers (VM)
+- gVisor/runsc (kernel)
+- k8s runtimes (CRI, RuntimeClass)
+
+*"crictl rmp the-end"* 😄
+
+---
+
+### 8.3 OS Level Security Domains
+
+#### Concept
+- Security Contexts
+- Pod Security Policies (⚠️ removed in v1.25, see below)
+- Scenarios
+
+#### Security Contexts
+Define privilege and access control for a Pod/Container:
+- userID and groupID
+- Run privileged or unprivileged
+- Linux capabilities
+
+```yaml
+spec:
+  volumes:
+  - name: vol
+    emptyDir: {}
+  securityContext:          # ← Pod level (all containers)
+    runAsUser: 1000
+    runAsGroup: 3000
+    fsGroup: 2000
+  containers:
+  - command: ["sh", "-c", "sleep 1d"]
+    image: busybox
+    name: my-pod
+    securityContext:        # ← Container level (overrides pod level)
+      runAsUser: 0
+```
+```
+/ $ id
+uid=1000  gid=3000  groups=2000
+     │        │           └─ fsGroup     = supplementary group id (owns mounted volumes)
+     │        └─ runAsGroup = main group id
+     └─ runAsUser = user id
+```
+> Pod-level fields apply to all containers. Container-level fields win if both are set. `capabilities`, `privileged`, `allowPrivilegeEscalation` and `readOnlyRootFilesystem` exist **only** at container level.
+
+#### Hands-on 1: Security Contexts & UID/GID
+Change the user and group under which the container processes are running.
+```bash
+k run pod --image=busybox --command -o yaml --dry-run=client -- sh -c 'sleep 1d' > pod.yaml
+# add spec.securityContext: runAsUser 1000, runAsGroup 3000
+k -f pod.yaml create
+k exec -it pod -- sh
+id                          # uid=1000 gid=3000
+touch test                  # Permission denied (/ is owned by root)
+cd /tmp && touch test && ls -lh   # works: owned by 1000:3000
+```
+
+#### Hands-on 2: Force container to run as non-root
+```yaml
+    securityContext:
+      runAsNonRoot: true
+```
+- Image runs as root and no `runAsUser` is set → pod fails with `CreateContainerConfigError: container has runAsNonRoot and image will run as root`.
+- Fix: also set `runAsUser: 1000` (pod or container level).
+
+#### Privileged containers
+- By default, Docker containers run **"unprivileged"**.
+- You can run them as privileged to:
+  - access all devices,
+  - run the Docker daemon inside a container (`docker run --privileged`).
+- **Privileged means that container user 0 (root) is directly mapped to host user 0 (root).**
+- By default in Kubernetes, containers are **not** running privileged.
+```yaml
+    securityContext:
+      privileged: true
+```
+
+#### Hands-on 3: Enable privileged and test using sysctl (his terminal)
+```bash
+k exec -it pod -- sh
+/ # sysctl kernel.hostname=attacker
+sysctl: error setting key 'kernel.hostname': Read-only file system     # not privileged
+/ # id
+uid=0(root) gid=0(root) groups=10(wheel)                              # root, but still blocked!
+
+# set securityContext.privileged: true, recreate:
+k -f pod.yaml delete --force --grace-period 0 && k -f pod.yaml create
+k exec -it pod -- sh
+/ # sysctl kernel.hostname=attacker
+kernel.hostname = attacker                                             # ✅ kernel setting changed
+```
+> Key point: being **root inside a container ≠ privileged**. Without `privileged`, root is still restricted (read-only `/proc/sys`, limited capabilities).
+
+#### PrivilegeEscalation
+| **Privileged** | **PrivilegeEscalation** |
+|---|---|
+| Container user 0 (root) is directly mapped to host user 0 (root) | Controls whether a process can gain **more privileges than its parent** process |
+
+- **By default, Kubernetes allows PrivilegeEscalation.**
+```yaml
+    securityContext:
+      allowPrivilegeEscalation: false
+```
+
+#### Hands-on 4: Disable PrivilegeEscalation (his terminal)
+```bash
+k exec -it pod -- sh
+/ # cat /proc/1/status | grep NoNewPrivs
+NoNewPrivs:     0     # escalation allowed (default)
+# set allowPrivilegeEscalation: false, recreate pod
+NoNewPrivs:     1     # escalation blocked ✅
+```
+`/proc/1/status` also shows `CapEff` (effective capabilities, decode with `capsh --decode=<hex>`) and `Seccomp` (0 = disabled, 2 = filter).
+
+#### Pod Security Policies → Pod Security Admission (2026 note)
+> ⚠️ The video covers **PodSecurityPolicy (PSP)**. PSP was deprecated in 1.21 and **removed in 1.25**. Its replacement is **Pod Security Admission (PSA)**, which is built in and enabled by default.
+
+PSA works with **namespace labels** and three levels: `privileged` (no restrictions) → `baseline` (blocks known escalations like privileged and hostPath) → `restricted` (non-root, drop ALL caps, seccomp, no escalation).
+```bash
+k label ns team-a pod-security.kubernetes.io/enforce=baseline        # reject violating pods
+k label ns team-a pod-security.kubernetes.io/warn=restricted         # warn only
+k label ns team-a pod-security.kubernetes.io/audit=restricted        # audit log only
+k -n team-a run p --image=nginx --privileged                         # → Error: violates PodSecurity "baseline:latest"
+```
+> ⚠️ PSA only checks pods **at creation**. Existing pods keep running. Delete and recreate them (or `rollout restart` the deployment) to see the violation.
+
+A pod that passes `restricted`:
+```yaml
+spec:
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: app
+    image: nginx
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+```
+
+---
+
+### 8.4 mTLS — Mutual TLS
+
+#### Concept
+- mTLS / pod-to-pod communication
+- Service meshes
+- Scenarios
+
+#### mTLS — Mutual TLS
+- Mutual authentication.
+- Two-way (bilateral) authentication.
+- Two parties authenticating each other at the same time.
+
+#### K8s pod-to-pod communication
+```
+Request ──https──► [🔒 Ingress] ──► pod1 🔒 ─── pod2 🔒
+                                     │  ╲     ╱  │
+                                    pod4 🔒 ── pod3 🔒          😈 attacker inside the cluster
+```
+- By default, pod-to-pod traffic is **unencrypted**, and TLS usually terminates at the Ingress.
+- If an attacker gets into the cluster, they can **intercept/sniff traffic between pods**.
+- mTLS: **every pod** encrypts and authenticates its traffic.
+
+#### mTLS between pods
+```
+                       CA
+          pod1 [app 🔒] ⇄ [🔒 app] pod2
+     client cert + server cert   server cert + client cert
+                Rotate!
+```
+- Each app needs a **client cert** (to call others) and a **server cert** (to be called), all signed by a shared **CA**.
+- Certs must be **rotated** regularly → painful to do inside every app.
+
+#### ServiceMesh / Proxy
+```
+pod1 [app ↓ proxy 🔒] ────────► [🔒 proxy ↑ app] pod2
+       ▲
+ Service Mesh (external manager): CA + certs
+```
+- A **proxy sidecar** in every pod handles TLS. The app itself talks plain HTTP to localhost.
+- A **service mesh** (Istio, Linkerd) manages the CA and issues/rotates the certs automatically.
+- **iptables rules route traffic via the proxy**:
+  - like by initContainer,
+  - **needs the `NET_ADMIN` capability**.
+- Alternative (current curriculum): **Cilium** with transparent encryption (WireGuard/IPsec), no sidecars.
+
+#### Hands-on: Create a proxy sidecar with NET_ADMIN capability (his YAML)
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: app
+  name: app
+spec:
+  containers:
+  - command:
+    - sh
+    - -c
+    - ping google.com
+    image: bash
+    name: app
+  - name: proxy
+    image: ubuntu
+    command:
+    - sh
+    - -c
+    - 'apt-get update && apt-get install iptables -y && iptables -L && sleep 1d'
+    securityContext:
+      capabilities:
+        add: ["NET_ADMIN"]
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+```
+```bash
+k -f app.yaml create
+k logs app -c proxy          # iptables -L output → works
+# without NET_ADMIN: "iptables: Permission denied (you must be root)" / "can't initialize iptables table"
+```
+> Capabilities are per container, so the `app` container still has no `NET_ADMIN`.
+
+#### Section summary
+- mTLS
+- Pod-to-pod communication
+- Create sidecar proxy
+- `NET_ADMIN` capability
+
+> **Cluster Reset:** every new section works with a fresh cluster.
+
+---
+
+### 8.5 Open Policy Agent (OPA) / Gatekeeper
+
+#### Concept
+- Introduction to OPA and Gatekeeper
+- Enforce labels
+- Enforce pod replica count
+
+#### Request workflow (recap)
+`Human user / Pod (SA)` → **1 Authentication** ("who are you?") → **2 Authorization** ("are you allowed to create pods?") → **3 Admission Control** ("has the pod all required labels?") → **4** etcd.
+→ OPA Gatekeeper plugs in at step **3** as a validating (and mutating) **admission webhook**.
+
+#### OPA — Open Policy Agent
+> "The Open Policy Agent (OPA) is an open source, general-purpose policy engine that enables unified, context-aware policy enforcement across the entire stack."
+
+- Not Kubernetes specific.
+- Easy implementation of policies (**Rego** language).
+- Works with JSON/YAML.
+- In K8s it uses **Admission Controllers**.
+- Does not know concepts like pods or deployments.
+
+#### OPA Gatekeeper
+- Provides **K8s CRDs** (Custom Resource Definitions) on top of OPA, so policies are k8s objects.
+```
+ConstraintTemplate  (apiVersion: templates.gatekeeper.sh/v1, kind: ConstraintTemplate, name: k8srequiredlabels)
+   "search for necessary labels"  → contains the Rego + creates a new CRD kind: K8sRequiredLabels
+        │                                   │
+        ▼                                   ▼
+Constraint (kind: K8sRequiredLabels)   Constraint (kind: K8sRequiredLabels)
+ "Pods must have label X"               "Namespaces must have label Y"
+```
+
+#### Hands-on 1: Install OPA Gatekeeper
+```bash
+# make sure no other admission plugins interfere (course: only NodeRestriction)
+grep admission /etc/kubernetes/manifests/kube-apiserver.yaml
+kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/v3.18.0/deploy/gatekeeper.yaml
+k -n gatekeeper-system get pod,svc
+k get crd | grep gatekeeper
+k get validatingwebhookconfigurations
+```
+> Check the latest release tag on GitHub (`open-policy-agent/gatekeeper`). The course repo pins an old version.
+
+#### Hands-on 2: Deny All — Approve All policy
+Course files: `cks-course-environment/course-content/opa/deny-all/`
+```yaml
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8salwaysdeny
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sAlwaysDeny
+      validation:
+        openAPIV3Schema:
+          properties:
+            message:
+              type: string
+  targets:
+  - target: admission.k8s.gatekeeper.sh
+    rego: |
+      package k8salwaysdeny
+      violation[{"msg": msg}] {
+        1 > 0                                  # always true → always violation
+        msg := input.parameters.message
+      }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sAlwaysDeny
+metadata:
+  name: pod-always-deny
+spec:
+  match:
+    kinds:
+    - apiGroups: [""]
+      kinds: ["Pod"]
+  parameters:
+    message: "ACCESS DENIED!"
+```
+```bash
+k get constrainttemplates
+k get k8salwaysdeny
+k run pod --image=nginx       # Error from server (Forbidden): admission webhook "validation.gatekeeper.sh" denied the request: [pod-always-deny] ACCESS DENIED!
+k describe k8salwaysdeny pod-always-deny     # shows "Total Violations" by EXISTING resources (audit)
+```
+Change the rule to `1 > 2` (never true) → **approve all**: pods can be created again.
+> A Rego rule produces a violation only if **all** lines inside it are true (implicit AND).
+
+#### Hands-on 3: Enforce namespace/pod labels
+Course files: `course-content/opa/namespace-labels/`. Library: `open-policy-agent/gatekeeper-library` → `requiredlabels`.
+```yaml
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: ns-must-have-cks
+spec:
+  match:
+    kinds:
+    - apiGroups: [""]
+      kinds: ["Namespace"]
+  parameters:
+    labels: ["cks"]
+```
+```bash
+k create ns test              # denied: you must provide labels: {"cks"}
+k create ns test --dry-run=client -o yaml | k label -f - cks=amazing --local -o yaml | k create -f -
+```
+
+#### Hands-on 4: Enforce Deployment replica count
+Course files: `course-content/opa/deployment-replica-count/`. Constraint kind `K8sMinReplicaCount` with `parameters.min: 2`.
+```bash
+k create deploy test --image=nginx          # denied: replicas 1 < min 2
+k create deploy test --image=nginx --replicas 3   # ✅
+```
+
+#### Rego Playground
+https://play.openpolicyagent.org — test Rego with INPUT/OUTPUT before putting it in a template.
+```rego
+package play
+default hello = false
+hello {
+    m := input.message
+    m == "world"
+}
+```
+INPUT `{"message": "world"}` → OUTPUT `{"hello": true}`. Change the input to `"hello"` → `false`. And more examples are under the "Examples" menu.
+
+> ⚠️ Newer Rego (OPA v1) syntax requires `if`/`contains`: `violation contains {"msg": msg} if { ... }`. Gatekeeper still accepts the old syntax by default.
+
+#### Section summary
+- OPA overview
+- Used Gatekeeper's CRDs
+- Created templates and constraints
+- Rego
 
 
 ### 8.x etcd Encryption at Rest — Lab Incident & Recovery (from my lab, Nov 2026)
@@ -2020,7 +2446,33 @@ The apiserver's startup/liveness/readiness probes (`/livez`, `/readyz`) are **an
 Fix: remove the flag (`sed -i '/--anonymous-auth=false/d' /etc/kubernetes/manifests/kube-apiserver.yaml`). To keep anonymous off properly, use an `AuthenticationConfiguration` that allows anonymous **only** for `/livez`, `/readyz` and `/healthz`.
 
 ## 9. Domain 5 — Supply Chain Security
-*TODO — Trivy, kubesec, ImagePolicyWebhook, SBOM, static analysis*
+*Still TODO: Trivy, kubesec, ImagePolicyWebhook, SBOM, static analysis*
+
+### 9.1 Image Footprint
+*Course chapter: "Image footprint" at ~7:06. Screenshots still to come.*
+
+#### Lab note: multi-stage build failed on `apt-get` (from my lab, Nov 2026)
+```
+E: Failed to fetch http://archive.ubuntu.com/.../liblocale-gettext-perl_1.07-4_amd64.deb  Connection failed [IP: 185.125.190.82 80]
+The command '/bin/sh -c apt-get update && apt-get install -y golang-go=2:1.13~1ubuntu2' returned a non-zero code: 100
+```
+- **Cause:** a network drop during one package download. The Dockerfile itself was fine.
+- **Fixes:** retry with `docker build --no-cache -t app .`, **or** point apt at the AWS regional mirror (`sed -i 's|http://archive.ubuntu.com|http://eu-west-1.ec2.archive.ubuntu.com|g' /etc/apt/sources.list`), **or** (best) use an official Go image for the build stage:
+```dockerfile
+# build container stage 1
+FROM golang:1.23-alpine
+WORKDIR /
+COPY app.go .
+RUN CGO_ENABLED=0 go build app.go
+
+# app container stage 2
+FROM alpine:3.20
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup -h /home/appuser
+COPY --from=0 /app /home/appuser/
+USER appuser
+CMD ["/home/appuser/app"]
+```
+Same lesson (multi-stage → small image, non-root user) with supported base images. Check with `docker images | grep app`.
 
 ## 10. Domain 6 — Monitoring, Logging & Runtime Security
 *TODO — Falco, audit logs, immutable containers*
@@ -2063,6 +2515,9 @@ cat /proc/<pid>/root/<path>                                 # read files inside 
 ETCDCTL_API=3 etcdctl --cert ... --key ... --cacert ... get /registry/secrets/<ns>/<name>
 k get secrets -A -o json | k replace -f -                   # re-encrypt/decrypt all secrets
 kubeadm upgrade plan / kubeadm upgrade apply vX.Y.Z / kubeadm upgrade node
+k exec <pod> -- cat /proc/1/status | grep -E "NoNewPrivs|CapEff|Seccomp"
+k label ns <ns> pod-security.kubernetes.io/enforce=restricted
+k get constrainttemplates; k get constraints
 k drain <node> --ignore-daemonsets && k uncordon <node>
 ```
 
@@ -2088,6 +2543,11 @@ Quick lookup: **error message → section**. Every entry comes from my own lab.
 | apiserver `0/1`, restart count climbing; controller-manager CrashLoopBackOff; pods `Unknown` | `--anonymous-auth=false` breaks the probes | 8.z |
 | `corrupt object ... no matching prefix found` | Encryption config can't decrypt stored data | 8.x |
 | `failed to sync configmap cache: timed out waiting for the condition` | Apiserver can't list configmaps (encryption) / broken kubelet watch | 8.x |
+| `sysctl: error setting key ... Read-only file system` as root | Container not privileged (root ≠ privileged) | 8.3 |
+| `container has runAsNonRoot and image will run as root` | `runAsNonRoot: true` without `runAsUser` | 8.3 |
+| `violates PodSecurity "baseline:latest"` | PSA namespace label blocks the pod | 8.3 |
+| `admission webhook "validation.gatekeeper.sh" denied the request` | Gatekeeper constraint violation | 8.5 |
+| `apt-get ... Connection failed` during `docker build` | Network drop; retry / regional mirror / golang image | 9.1 |
 | `no runtime for "runsc" is configured` | Missing containerd runtime entry | 8.y |
 | `cgroups V2 is not yet supported` | Old gVisor binary | 8.y |
 | `-bash: /usr/local/bin/runsc: No such file or directory` | bash path cache → `hash -r` | 8.y |
