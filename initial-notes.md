@@ -36,7 +36,9 @@
 | 23 | Supply Chain Security – Image Footprint | 7:06:xx | Supply Chain Security | ✅ |
 | 24 | Supply Chain Security – Static Analysis | 7:28:xx | Supply Chain Security | ✅ |
 | 25 | Supply Chain Security – Image Vulnerability Scanning | 7:52:41 | Supply Chain Security | ✅ |
-| 26 | Supply Chain Security – Secure Supply Chain | 8:09:xx | Supply Chain Security | ⏳ |
+| 26 | Supply Chain Security – Secure Supply Chain | 8:09:xx | Supply Chain Security | ✅ |
+| 27 | Runtime Security – Behavioral Analytics at host and container level | 8:30:xx | Monitoring, Logging & Runtime | ✅ |
+| 28 | Runtime Security – Immutability of containers at runtime | 9:17:xx | Monitoring, Logging & Runtime | ⏳ |
 
 ---
 
@@ -76,7 +78,9 @@
    - [9.2 Static Analysis (kubesec, conftest)](#92-static-analysis-of-user-workloads)
    - [9.3 Image Vulnerability Scanning (Trivy)](#93-scan-images-for-known-vulnerabilities)
    - [9.4 Secure Supply Chain](#94-secure-supply-chain)
-10. [Domain 6 — Monitoring, Logging & Runtime Security](#10-domain-6--monitoring-logging--runtime-security) — *TODO*
+10. [Domain 6 — Monitoring, Logging & Runtime Security](#10-domain-6--monitoring-logging--runtime-security)
+   - [10.1 Behavioral Analytics (strace, /proc, Falco)](#101-behavioral-analytics-at-host-and-container-level)
+   - [10.2 Immutability of Containers](#102-immutability-of-containers-at-runtime)
 11. [Quick Reference](#11-quick-reference)
 
 ---
@@ -2845,10 +2849,406 @@ vim /etc/kubernetes/manifests/kube-apiserver.yaml
 ```
 > Video uses `k8s.gcr.io` (frozen). Current registry: `registry.k8s.io`.
 
-*Next: validate and whitelist images and registries (OPA / ImagePolicyWebhook) — TODO, next screenshots.*
+#### Hands-on 1: Use image digest (his terminal)
+**Task:** list all image registries used in the whole cluster, then use the image digest for kube-apiserver.
+```bash
+k get pod -A -oyaml | grep "image:"                  # includes managedFields noise (f:image: {})
+k get pod -A -oyaml | grep "image:" | grep -v "f:"   # clean list
+# image: k8s.gcr.io/coredns:1.7.0, k8s.gcr.io/etcd:3.4.13-0, k8s.gcr.io/kube-apiserver:v1.19.3 ...
+# image: docker.io/weaveworks/weave-kube:2.7.0, weaveworks/weave-npc:2.7.0
+# → registries in use: k8s.gcr.io, docker.io
+```
+Cleaner alternative:
+```bash
+k get pod -A -o jsonpath='{..image}' | tr ' ' '\n' | sort -u
+```
+Get the digest from the running pod and pin it in the manifest:
+```bash
+k -n kube-system get pod kube-apiserver-cks-master -oyaml | grep imageID
+# imageID: docker-pullable://k8s.gcr.io/kube-apiserver@sha256:6ea8c40355df6c6c47050448e1f88cb4a5d618e9e96717818d4e11fcfe156ee0
+vim /etc/kubernetes/manifests/kube-apiserver.yaml
+#   image: k8s.gcr.io/kube-apiserver:v1.19.3
+# → image: k8s.gcr.io/kube-apiserver@sha256:6ea8c40355df6c6c47050448e1f88cb4a5d618e9e96717818d4e11fcfe156ee0
+```
+> On containerd the `imageID` has no `docker-pullable://` prefix. Copy only `registry/name@sha256:...`.
+
+#### Hands-on 2: Whitelist registries with OPA
+**Task:** only images from `docker.io` and `k8s.gcr.io` can be used.
+Course files: `course-content/supply-chain-security/secure-the-supply-chain/whitelist-registries/opa/`
+```yaml
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8strustedimages
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sTrustedImages
+  targets:
+  - target: admission.k8s.gatekeeper.sh
+    rego: |
+      package k8strustedimages
+      violation[{"msg": msg}] {
+        image := input.review.object.spec.containers[_].image
+        not startswith(image, "docker.io/")
+        not startswith(image, "k8s.gcr.io/")
+        msg := "not trusted image!"
+      }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sTrustedImages
+metadata:
+  name: pod-trusted-images
+spec:
+  match:
+    kinds:
+    - apiGroups: [""]
+      kinds: ["Pod"]
+```
+```bash
+k run test --image=nginx                    # denied: "nginx" has no registry prefix
+k run test --image=docker.io/nginx          # ✅
+```
+> Short names like `nginx` are expanded to `docker.io/library/nginx` by the runtime, but the **pod spec** still says `nginx`, and that's what OPA sees.
+
+#### ImagePolicyWebhook
+```
+Api Request → ApiServer → Allow/Deny
+                 ↕
+        AdmissionControllers
+                 ↕
+        ImagePolicyWebhook ──"kind":"ImageReview"──► External Service
+```
+The apiserver sends an `ImageReview` to an external service, which answers allow or deny:
+```json
+{
+  "apiVersion":"imagepolicy.k8s.io/v1alpha1",
+  "kind":"ImageReview",
+  "spec":{
+    "containers":[
+      {"image":"myrepo/myimage:v1"},
+      {"image":"myrepo/myimage@sha256:beb6bd6a68f114c1dc2ea4b28db81bdf91de202a9014972bec5e4d9171d90ed"}
+    ],
+    "annotations":{"mycluster.image-policy.k8s.io/ticket-1234": "break-glass"},
+    "namespace":"mynamespace"
+  }
+}
+```
+
+#### Hands-on 3: Investigate ImagePolicyWebhook (his terminal)
+**Task:** investigate ImagePolicyWebhook and use it up to the point where it calls an external service.
+
+**Step 1: enable the plugin only → apiserver won't start**
+```bash
+vim /etc/kubernetes/manifests/kube-apiserver.yaml
+#   - --enable-admission-plugins=NodeRestriction,ImagePolicyWebhook
+k get pod
+# The connection to the server 10.154.0.2:6443 was refused
+cd /var/log/pods/
+tail -f kube-system_kube-apiserver-cks-master_<uid>/kube-apiserver/0.log
+# Error: failed to initialize admission: couldn't init admission plugin "ImagePolicyWebhook": no config specified
+```
+✅ **Reproduced on my cluster (v1.37.1):**
+```
+E1124 12:03:06.158704  1 run.go:72] "command failed" err="failed to apply admission: couldn't init admission plugin \"ImagePolicyWebhook\": no config specified"
+```
+> `tail` on a log number that no longer exists (`4.log`) → `No such file or directory`. The number increases with every restart, so `ls` the dir first or use `tail -f */kube-apiserver/*.log`.
+
+**Step 2: copy the course files**
+```bash
+git clone https://github.com/killer-sh/cks-course-environment.git
+cp -r cks-course-environment/course-content/supply-chain-security/secure-the-supply-chain/whitelist-registries/ImagePolicyWebhook/ /etc/kubernetes/admission
+cd /etc/kubernetes/admission && ll
+# admission_config.yaml  apiserver-client-cert.pem  apiserver-client-key.pem
+# external-cert.pem      external-key.pem           kubeconf
+```
+
+**Step 3: `admission_config.yaml`**
+```yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+  - name: ImagePolicyWebhook
+    configuration:
+      imagePolicy:
+        kubeConfigFile: /etc/kubernetes/admission/kubeconf
+        allowTTL: 50           # seconds to cache an "allow" answer
+        denyTTL: 50            # seconds to cache a "deny" answer
+        retryBackoff: 500      # ms between retries
+        defaultAllow: false    # ← if the external service is unreachable: DENY all pods (fail closed)
+```
+
+**Step 4: `kubeconf`** (a kubeconfig that points at the external service, not at a cluster)
+```yaml
+apiVersion: v1
+kind: Config
+# clusters refers to the remote service.
+clusters:
+- cluster:
+    certificate-authority: /etc/kubernetes/admission/external-cert.pem  # CA for verifying the remote service.
+    server: https://external-service:1234/check-image                   # URL of remote service to query. Must use 'https'.
+  name: image-checker
+contexts:
+- context:
+    cluster: image-checker
+    user: api-server
+  name: image-checker
+current-context: image-checker
+preferences: {}
+# users refers to the API server's webhook configuration.
+users:
+- name: api-server
+  user:
+    client-certificate: /etc/kubernetes/admission/apiserver-client-cert.pem  # cert for the webhook admission controller to use
+    client-key:  /etc/kubernetes/admission/apiserver-client-key.pem          # key matching the cert
+```
+
+**Step 5: apiserver manifest: flag + volumeMount + hostPath** (same rule as 6.5/8.x!)
+```yaml
+    - --admission-control-config-file=/etc/kubernetes/admission/admission_config.yaml
+    - --enable-admission-plugins=NodeRestriction,ImagePolicyWebhook
+    volumeMounts:
+    - mountPath: /etc/kubernetes/admission
+      name: k8s-admission
+      readOnly: true
+  volumes:
+  - hostPath:
+      path: /etc/kubernetes/admission
+      type: DirectoryOrCreate
+    name: k8s-admission
+```
+
+**Step 6: test**
+```bash
+k -n kube-system get pod                     # apiserver back, all Running
+k run test --image=nginx
+# Error from server (Forbidden): pods "test" is forbidden: Post "https://external-service:1234/check-image?timeout=30s":
+#   dial tcp: lookup external-service on 169.254.169.254:53: no such host
+```
+✅ That's the goal: the apiserver **calls the external service**. It doesn't exist, and with `defaultAllow: false` → pod denied.
+Set `defaultAllow: true` → pods are allowed while the service is unreachable (fail open). Note: static pods/control plane already running are not affected.
+Example real backend: https://github.com/flavio/kube-image-bouncer
+
+> **Exam pattern:** "ImagePolicyWebhook is configured but incomplete, fix it": check the flag in `--enable-admission-plugins`, `--admission-control-config-file`, the volume mount, the `kubeConfigFile` path, the `server:` URL, and `defaultAllow` (usually must be `false`).
+
+#### Section summary
+- How k8s works with registries
+- Image tags and digests
+- Whitelist registries with OPA
+- ImagePolicyWebhook
 
 ## 10. Domain 6 — Monitoring, Logging & Runtime Security
-*TODO — Falco, audit logs, immutable containers*
+*Still TODO: Auditing (audit policy/logs)*
+
+### 10.1 Behavioral Analytics at Host and Container Level
+
+#### Concept
+- Syscalls and processes
+- strace and /proc
+- Tools and scenarios: **Falco**
+
+#### Kernel vs user space (recap, see 4.2)
+```
+USER SPACE    Applications (Firefox, Curl)  →  Libraries (glibc, libxyz)
+              ─── seccomp / AppArmor ───   ← filter BEFORE the syscall reaches the kernel
+KERNEL SPACE  Syscall Interface (getpid(), reboot()) → Linux Kernel → Hardware
+```
+Containers (docker/containerd) are just processes in user space making syscalls to the **same** kernel.
+Full syscall list: https://man7.org/linux/man-pages/man2/syscalls.2.html ("the fundamental interface between an application and the Linux kernel").
+
+#### strace
+- Intercepts and logs **system calls** made by a process.
+- Logs and displays **signals** received by a process.
+- Diagnostic, learning, debugging.
+```
+strace
+  -o filename    write output to a file
+  -v             verbose
+  -f             follow forks (child processes/threads)
+  -cw            count and summarise (wall time)
+  -p pid         attach to a running process
+  -P path        only syscalls touching this path
+```
+
+#### Hands-on 1: strace "ls" (his terminal)
+**Task:** investigate what it does and find all syscalls.
+```bash
+strace ls /              # every syscall line by line, ends with "+++ exited with 0 +++"
+strace -cw ls /          # summary table
+```
+```
+% time     seconds  usecs/call     calls    errors syscall
+ 19.51    0.001188          40        30           mmap
+ 16.08    0.000979          41        24           openat
+ 14.78    0.000900          36        25           fstat
+ 13.71    0.000835          32        26           close
+  8.33    0.000507          42        12           mprotect
+  ...
+  5.24    0.000319          40         8         8 access
+  3.68    0.000224         224         1           execve
+  1.63    0.000099          50         2           getdents
+100.00    0.006090                   156        10 total
+```
+> A simple `ls` makes ~156 syscalls. `openat` + `getdents` = open the directory and read the entries, `write` = print.
+
+#### /proc directory
+- Information and connections to processes and kernel.
+- Study it to learn how processes work.
+- Configuration and administrative tasks.
+- Contains files that don't exist, yet you can access these (virtual filesystem, generated by the kernel).
+- `/proc/<PID>/`: `exe` (binary), `cmdline`, `environ`, `fd/` (open files), `root/` (process root fs), `status`, `ns/`, `cgroup`.
+
+#### Hands-on 2: strace and /proc on etcd (his terminal)
+**Task:** strace Kubernetes etcd: 1. list syscalls, 2. find open files, 3. read secret value 😈
+```bash
+ps aux | grep etcd                         # PID e.g. 3502
+strace -p 3502 -f                          # live syscalls (futex, epoll_pwait, read, write …)
+strace -p 3502 -f -cw                      # Ctrl+C after a few seconds → summary
+#  … write 223, fdatasync 16, read 180 (86 errors), pwrite64, epoll_ctl, accept4, openat …
+cd /proc/3502 && ls -lh exe                # exe -> /usr/local/bin/etcd
+cd fd && ls -l                             # 0..87 → sockets, pipes, and the etcd db file
+ls -l | grep db                            # e.g. 7 -> /var/lib/etcd/member/snap/db
+tail -f 7                                  # binary bbolt db: you can see node names, leases, member URLs
+```
+Read a secret straight from etcd's open db file:
+```bash
+k create secret generic credit-card --from-literal cc=1111222233334444
+cat 7 | grep 1111222233334444              # "Binary file (standard input) matches"
+cat 7 | strings | grep 1111222233334444    # 1111222233334444  ← plain text!
+```
+> Without **encryption at rest** (8.1/8.x), anyone with root on the control plane reads secrets via `/proc/<etcd-pid>/fd/`. With aescbc you'd only see `k8s:enc:aescbc:v1:...`.
+
+#### Hands-on 3: /proc access env variables (his terminal)
+**Task:** create an Apache pod with a secret as environment variable and read that secret from the host filesystem.
+```bash
+k run apache --image=httpd --env SECRET=5555666677778888 -oyaml --dry-run=client > apache.yaml
+k -f apache.yaml create
+k get pod apache -o wide                     # → node cks-worker
+# on the worker:
+ps aux | grep httpd                          # several httpd processes
+pstree -p                                    # find the parent httpd PID, e.g. 28696
+cd /proc/28696
+ls -lh exe                                   # exe -> /usr/local/apache2/bin/httpd
+ls -lha fd                                   # 0 -> /dev/null, 1/2 -> pipes, 3 -> socket
+cat environ
+# ...HTTPD_VERSION=2.4.46HOSTNAME=apache...SECRET=5555666677778888HTTPD_PREFIX=/usr/local/apache2...
+cat environ | tr '\0' '\n' | grep SECRET     # readable version (entries are NUL-separated)
+```
+> 🔴 **Secrets as environment variables can be read from anyone who can access /proc on the host.** Prefer secret volumes (and restrict node access).
+
+#### Falco
+- Cloud-native runtime security (**CNCF**). Originally created by **Sysdig**.
+- **ACCESS:** deep kernel tracing built on the Linux kernel.
+- **ASSERT:** describe security rules against a system (+ default ones), detect unwanted behaviour.
+- **ACTION:** automated response to security violations.
+
+Docs: https://falco.org/docs · fields: https://falco.org/docs/rules/supported-fields · k8s docs "Auditing with Falco" (old v1.16 page).
+
+#### Hands-on 4: Install Falco on the worker node
+Course `Resources.md` (old, pinned):
+```bash
+curl -s https://falco.org/repo/falcosecurity-packages.asc | apt-key add -
+echo "deb https://download.falco.org/packages/deb stable main" | tee -a /etc/apt/sources.list.d/falcosecurity.list
+apt-get update -y
+apt-get install -y linux-headers-$(uname -r)
+apt-get install -y falco=0.32.1
+```
+**What I used (2026):** `apt-key` is deprecated, and current Falco uses the **modern eBPF** driver (no kernel headers/module needed):
+```bash
+curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main" > /etc/apt/sources.list.d/falcosecurity.list
+apt-get update && apt-get install -y falco           # choose "Modern eBPF" in the dialog
+systemctl status falco-modern-bpf --no-pager
+```
+
+#### My install log explained (Falco 0.45.2, Nov 2026)
+| Log line | Meaning |
+|---|---|
+| `falco-modern-bpf.service` / `Opening 'syscall' source with modern BPF probe` | Modern eBPF driver: no kernel module |
+| `Loaded plugin 'container@0.7.6'` + many runtime sockets | Since 0.41 container/k8s metadata comes from a plugin. It tries every socket; only `/run/containerd/containerd.sock` exists, the rest is harmless |
+| `falco_rules.yaml \| schema validation: ok` | Default rules. **Don't edit**: overwritten on updates |
+| `falco_rules.local.yaml \| schema validation: none` | **My custom rules / overrides.** `none` = empty file |
+| `falcoctl ... falco-rules:5, check every: 168h` | Weekly automatic default-rule updates |
+| `health webserver ... listening on 0.0.0.0:8765` | Health endpoint on all interfaces |
+
+#### Hands-on 5: Look at existing Falco rules (his terminal, Falco 0.2x)
+```bash
+cd /etc/falco && ls
+# falco.yaml  falco_rules.local.yaml  falco_rules.yaml  k8s_audit_rules.yaml  rules.available  rules.d
+tail -f /var/log/syslog | grep falco
+# Notice Privileged container started (user=root ... container:e30ae569fb2b k8s_weave-npc_weave-net-... image=weaveworks/weave-npc:2.7.0)
+# Error File below /etc opened for writing (user=root ... command=vim falco.yaml ... file=/etc/falco/.falco.yaml.swp program=vim ... container_id=host)
+```
+> Just editing `falco.yaml` with vim on the host triggers "File below /etc opened for writing". Falco watches the **host** too (`container_id=host`).
+> Better than syslog: `journalctl -u falco-modern-bpf -f`
+
+#### Hands-on 6: Use Falco to find malicious processes inside containers
+```bash
+k exec -it apache -- bash                    # → Notice/Warning: "A shell was spawned in a container with an attached terminal"
+k exec apache -- cat /etc/shadow             # → Warning: Sensitive file opened for reading by non-trusted program
+k exec apache -- sh -c 'echo x >> /etc/passwd'   # → Error: File below /etc opened for writing
+```
+
+#### Hands-on 7: Change a Falco rule's output (from my lab)
+Override in `/etc/falco/falco_rules.local.yaml` (copy the whole rule, change only the output):
+```yaml
+- rule: Terminal shell in container
+  desc: A shell was used as the entrypoint/exec point into a container with an attached terminal.
+  condition: >
+    spawned_process
+    and container
+    and shell_procs
+    and proc.tty != 0
+    and container_entrypoint
+    and not user_expected_terminal_shell_in_container_conditions
+  output: A shell was spawned in a container with an attached terminal | %user.name, %evt.time, %container.id, %container.name
+  priority: WARNING
+  tags: [maturity_stable, container, shell, mitre_execution, T1059]
+```
+Or only replace the output (Falco ≥ 0.36):
+```yaml
+- rule: Terminal shell in container
+  output: A shell was spawned | %evt.time,%container.id,%container.name,%user.name
+  override:
+    output: replace
+```
+Run in the foreground to see output directly: `falco` (Ctrl+C prints a summary: events detected, rule counts by severity).
+
+**My result:**
+```
+08:53:44.924191745: Warning A shell was spawned in a container with an attached terminal | root, 08:53:44.924191745, 188e0dd5f672, apache container_id=188e0dd5f672 container_name=apache container_image_repository=docker.io/library/httpd container_image_tag=latest k8s_pod_name=apache k8s_ns_name=default
+Events detected: 1 · WARNING: 1 · Terminal shell in container: 1
+```
+**Gotcha: extra fields appended after my output.** It isn't the old rule. It's `append_output.suggested_output: true` in `falco.yaml` (the container plugin appends `container_id=… k8s_ns_name=…` to every rule).
+```bash
+grep -n "suggested_output:" /etc/falco/falco.yaml                   # line ~799
+sed -i 's/suggested_output: true/suggested_output: false/' /etc/falco/falco.yaml
+systemctl restart falco-modern-bpf
+```
+> Exam: tasks say "change the output format to `time,container-id,container-name,user-name`". Appended fields don't hurt. Useful fields: `%evt.time %container.id %container.name %user.name %proc.name %proc.cmdline %k8s.pod.name %k8s.ns.name`.
+
+---
+
+### 10.2 Immutability of Containers at Runtime
+
+#### Concept
+- Immutability
+- Container and pod level enforcement
+- Scenarios to ensure the pod's containers are immutable
+
+#### Immutability
+**Container won't be modified during its lifetime.**
+| Mutable | Immutable |
+|---|---|
+| 1. SSH on VM instance | 1. Create new VM image |
+| 2. Stop application | 2. Delete VM instance |
+| 3. Update application | 3. Create new VM instance |
+| 4. Start application | |
+
+Containers: never patch a running container. Build a new image and redeploy.
+
+*Rest of the chapter (enforcement: readOnlyRootFilesystem, startupProbe tricks, emptyDir for writable paths, RBAC) — TODO, next screenshots.*
 
 ---
 
@@ -2894,6 +3294,10 @@ k get constrainttemplates; k get constraints
 docker run -i kubesec/kubesec:512c5e0 scan /dev/stdin < pod.yaml
 docker run --rm -v $(pwd):/project openpolicyagent/conftest test deploy.yaml
 trivy image -s HIGH,CRITICAL <image>
+k get pod -A -o jsonpath='{..image}' | tr ' ' '\n' | sort -u     # all images/registries
+strace -cw <cmd> / strace -p <pid> -f -cw
+ls -l /proc/<pid>/{exe,fd}; cat /proc/<pid>/environ | tr '\0' '\n'
+journalctl -u falco-modern-bpf -f                                 # Falco alerts
 k create secret docker-registry <name> --docker-server=... --docker-username=... --docker-password=...
 k drain <node> --ignore-daemonsets && k uncordon <node>
 ```
@@ -2924,6 +3328,11 @@ Quick lookup: **error message → section**. Every entry comes from my own lab.
 | `container has runAsNonRoot and image will run as root` | `runAsNonRoot: true` without `runAsUser` | 8.3 |
 | `violates PodSecurity "baseline:latest"` | PSA namespace label blocks the pod | 8.3 |
 | `admission webhook "validation.gatekeeper.sh" denied the request` | Gatekeeper constraint violation | 8.5 |
+| `couldn't init admission plugin "ImagePolicyWebhook": no config specified` | Plugin enabled without `--admission-control-config-file` | 9.4 |
+| `pods "x" is forbidden: Post "https://external-service:1234/check-image..."` | ImagePolicyWebhook backend unreachable + `defaultAllow: false` | 9.4 |
+| `tail: cannot open '.../kube-apiserver/4.log'` | Log number changed after restart; `ls` first | 9.4 |
+| Falco output has extra `container_id=… k8s_ns_name=…` fields | `append_output.suggested_output: true` in falco.yaml | 10.1 |
+| `cat <file> \| grep x` → `Binary file matches` | Use `strings` first | 10.1 |
 | `"sh": executable file not found` on `docker exec` | Shell removed in hardened image (intended) | 9.1 |
 | conftest `FAIL - ... unallowed image found` | Rego denylist matched | 9.2 |
 | `apt-get ... Connection failed` during `docker build` | Network drop; retry / regional mirror / golang image | 9.1 |
