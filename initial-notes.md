@@ -38,7 +38,9 @@
 | 25 | Supply Chain Security – Image Vulnerability Scanning | 7:52:41 | Supply Chain Security | ✅ |
 | 26 | Supply Chain Security – Secure Supply Chain | 8:09:xx | Supply Chain Security | ✅ |
 | 27 | Runtime Security – Behavioral Analytics at host and container level | 8:30:xx | Monitoring, Logging & Runtime | ✅ |
-| 28 | Runtime Security – Immutability of containers at runtime | 9:17:xx | Monitoring, Logging & Runtime | ⏳ |
+| 28 | Runtime Security – Immutability of containers at runtime | 9:17:xx | Monitoring, Logging & Runtime | ✅ |
+| 29 | Runtime Security – Auditing | 9:34:xx | Monitoring, Logging & Runtime | ✅ |
+| 30 | System Hardening – Kernel Hardening Tools (AppArmor, seccomp) | 10:06:xx | System Hardening | ⏳ |
 
 ---
 
@@ -62,7 +64,8 @@
    - [6.3 Exercise Caution in Using ServiceAccounts](#63-exercise-caution-in-using-serviceaccounts)
    - [6.4 Restrict API Access](#64-restrict-api-access)
    - [6.5 Upgrade Kubernetes](#65-upgrade-kubernetes-update-frequently)
-7. [Domain 3 — System Hardening](#7-domain-3--system-hardening) — *TODO*
+7. [Domain 3 — System Hardening](#7-domain-3--system-hardening)
+   - [7.1 Kernel Hardening Tools (AppArmor & seccomp)](#71-kernel-hardening-tools-apparmor--seccomp)
 8. [Domain 4 — Minimize Microservice Vulnerabilities](#8-domain-4--minimize-microservice-vulnerabilities)
    - [8.1 Manage Kubernetes Secrets](#81-manage-kubernetes-secrets)
    - [8.2 Container Runtime Sandboxes](#82-container-runtime-sandboxes)
@@ -81,7 +84,9 @@
 10. [Domain 6 — Monitoring, Logging & Runtime Security](#10-domain-6--monitoring-logging--runtime-security)
    - [10.1 Behavioral Analytics (strace, /proc, Falco)](#101-behavioral-analytics-at-host-and-container-level)
    - [10.2 Immutability of Containers](#102-immutability-of-containers-at-runtime)
+   - [10.3 Auditing](#103-auditing)
 11. [Quick Reference](#11-quick-reference)
+   - [11.1 Shell & kubectl Tricks](#111-shell--kubectl-tricks)
 
 ---
 
@@ -1499,7 +1504,91 @@ Every new file/dir you point an apiserver flag at needs **flag + volumeMount + h
 Debug a broken apiserver: `crictl ps -a | grep apiserver` → `crictl logs <id>`, or `ls /var/log/pods/kube-system_kube-apiserver-*/`.
 
 ## 7. Domain 3 — System Hardening
-*TODO — AppArmor, seccomp, reduce the host OS footprint, IAM*
+*Still TODO: AppArmor hands-on (Docker & K8s), seccomp, reduce host OS footprint, IAM*
+
+### 7.1 Kernel Hardening Tools (AppArmor & seccomp)
+
+#### Concept
+- Overview
+- AppArmor (Docker & K8s)
+- Seccomp (Docker & K8s)
+
+#### Linux kernel isolation (recap, see 4.3)
+Container isolation = **Namespaces** (restrict what processes can see: other processes, users, filesystem) + **cgroups** (restrict resource usage: RAM, disk, CPU).
+
+#### Where AppArmor & seccomp sit
+```
+USER SPACE    Applications (Firefox, Curl) → Libraries (glibc, libxyz)
+              ┌─────── seccomp │ AppArmor ───────┐   ← extra layer before the kernel
+KERNEL SPACE  Syscall Interface (getpid(), reboot()) → Linux Kernel → Hardware
+```
+
+#### AppArmor
+- A **profile** per application (e.g. Firefox, kubelet) defines what the process may access: Filesystem ✅, Other processes ❌, Networks ❌.
+
+**Profile modes**
+| Mode | Effect |
+|---|---|
+| **Enforce** | Process **cannot escape** |
+| **Complain** | Process can escape **but it will be logged** |
+| **Unconfined** | Process can escape |
+
+**Main commands**
+```bash
+aa-status          # show all profiles
+aa-genprof         # generate a new profile (smart wrapper around aa-logprof)
+aa-complain        # put profile in complain mode
+aa-enforce         # put profile in enforce mode
+aa-logprof         # update the profile if app produced some more usage logs (syslog)
+apparmor_parser    # load a profile file into the kernel (exam!)
+```
+> `aa-*` tools come from the `apparmor-utils` package: `apt-get install -y apparmor-utils`. `aa-` alone is not a command — use Tab Tab.
+
+#### Hands-on 1: Setup simple AppArmor profile for curl
+```bash
+apt-get install -y apparmor-utils
+aa-genprof curl          # terminal 2: run `curl killer.sh -v` → back in terminal 1: S(can), allow/deny, F(inish)
+aa-status | grep curl    # /usr/bin/curl in enforce mode
+curl killer.sh -v        # now blocked (network denied)
+cat /etc/apparmor.d/usr.bin.curl
+aa-logprof               # update profile from new log entries
+```
+Hand-written alternative (fast, no wizard):
+```
+cat > /etc/apparmor.d/usr.bin.curl <<'EOF'
+#include <tunables/global>
+profile curl-deny /usr/bin/curl {
+  #include <abstractions/base>
+  deny network,
+  /usr/bin/curl mr,
+}
+EOF
+apparmor_parser -r /etc/apparmor.d/usr.bin.curl && aa-status | grep curl-deny
+```
+
+#### My lab issues with aa-genprof (Ubuntu 24.04, AppArmor 4.x)
+`aa-genprof` parses **all** profiles in `/etc/apparmor.d/` first and failed on shipped ones:
+| Error | Fix |
+|---|---|
+| `ERROR: Operation {'runbindable'} cannot have a source. Source = AARE('/')` | `grep -rln runbindable /etc/apparmor.d/` → `abstractions/passt` → move to `/root/aa-bak/` |
+| `ERROR: Include file /etc/apparmor.d/abstractions/passt not found` | Move profiles including it: `grep -rl "abstractions/passt" /etc/apparmor.d/` → `usr.bin.passt`, `abstractions/pasta` |
+| `ERROR: Include file /var/lib/snapd/apparmor/snap-confine not found` | `mkdir -p /var/lib/snapd/apparmor/snap-confine` |
+Restore afterwards:
+```bash
+mv /root/aa-bak/passt /root/aa-bak/pasta /etc/apparmor.d/abstractions/ && mv /root/aa-bak/usr.bin.passt /etc/apparmor.d/ && apparmor_parser -QT /etc/apparmor.d/ 2>&1 | head
+```
+> Loaded profiles stay active in the kernel while files are moved. Exam: you'll use `apparmor_parser`, rarely `aa-genprof`.
+
+#### Hands-on 2: AppArmor & Docker / K8s
+*Task: Nginx Docker container uses AppArmor profile — TODO, next screenshots.*
+K8s preview (1.30+):
+```yaml
+spec:
+  securityContext:
+    appArmorProfile:
+      type: Localhost
+      localhostProfile: <profile-name>     # profile must be loaded on the node running the pod
+```
 
 ## 8. Domain 4 — Minimize Microservice Vulnerabilities
 *Still TODO: Pod Security Admission, securityContext, mTLS/Cilium*
@@ -3039,7 +3128,6 @@ Example real backend: https://github.com/flavio/kube-image-bouncer
 - ImagePolicyWebhook
 
 ## 10. Domain 6 — Monitoring, Logging & Runtime Security
-*Still TODO: Auditing (audit policy/logs)*
 
 ### 10.1 Behavioral Analytics at Host and Container Level
 
@@ -3220,6 +3308,15 @@ Run in the foreground to see output directly: `falco` (Ctrl+C prints a summary: 
 08:53:44.924191745: Warning A shell was spawned in a container with an attached terminal | root, 08:53:44.924191745, 188e0dd5f672, apache container_id=188e0dd5f672 container_name=apache container_image_repository=docker.io/library/httpd container_image_tag=latest k8s_pod_name=apache k8s_ns_name=default
 Events detected: 1 · WARNING: 1 · Terminal shell in container: 1
 ```
+**In the video (Falco 0.26):** task slide = Rule *"A shell was spawned in a container with an attached terminal"*, Output format `TIME,USER-NAME,CONTAINER-NAME,CONTAINER-ID`, Priority `WARNING`.
+```bash
+cd /etc/falco && ls -lh
+grep -r "A shell was spawned in a container with an attached terminal" .   # → ./falco_rules.yaml   find the rule by its output text!
+falco --list=syscall | less                     # all available fields (or: falco.org/docs/rules/supported-fields)
+```
+His run ended with: `Events detected: 3 · NOTICE: 1 · INFO: 2 · Launch Privileged Container: 2 · Terminal shell in container: 1`.
+Section summary: syscalls · pods/containers/processes · strace /proc · Falco.
+
 **Gotcha: extra fields appended after my output.** It isn't the old rule. It's `append_output.suggested_output: true` in `falco.yaml` (the container plugin appends `container_id=… k8s_ns_name=…` to every rule).
 ```bash
 grep -n "suggested_output:" /etc/falco/falco.yaml                   # line ~799
@@ -3248,9 +3345,265 @@ systemctl restart falco-modern-bpf
 
 Containers: never patch a running container. Build a new image and redeploy.
 
-*Rest of the chapter (enforcement: readOnlyRootFilesystem, startupProbe tricks, emptyDir for writable paths, RBAC) — TODO, next screenshots.*
+**Why immutable?** We always know the state → advanced deployment methods, easy rollback, more reliability, better security (on container level).
+
+#### Enforce on container image level
+- Remove bash/shell
+- Make filesystem read-only
+- Run as user and non-root
+→ See 9.1 image hardening. *But what if we have no control of the container (or are too lazy)?* → enforce at pod level:
+
+#### Make manual changes to container — 3 ideas from the slides
+| Idea | How | Verdict |
+|---|---|---|
+| **Command** | `command: chmod a-w -R / && nginx` (lock FS, then start app) | Hacky, mixes logic into the start command |
+| **StartupProbe** | startupProbe runs `chmod a-w -R /` (or `rm /bin/bash`) while app container runs | Hacky — misuse of probes, but works |
+| **InitContainer** | init container has **Read-Write** to a shared VOLUME, app container only **Read** | Cleaner: prepare data in init, app mounts it read-only |
+
+#### Hands-on 1: StartupProbe for immutability
+**Task:** use StartupProbe to remove `touch` and `bash` from container.
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: immutable
+spec:
+  containers:
+  - image: httpd
+    name: immutable
+    startupProbe:
+      exec:
+        command:
+        - rm
+        - /bin/touch
+        - /bin/bash
+      initialDelaySeconds: 1
+      periodSeconds: 5
+```
+```bash
+k exec immutable -- touch /tmp/x       # executable file not found
+k exec -it immutable -- bash           # executable file not found
+```
+> Probe must succeed (`rm` exits 0) or the container never becomes Ready. If files are already gone on a retry, `rm` fails → use `rm -f`.
+
+#### Enforce Read-Only Root Filesystem
+Using **SecurityContexts** and PodSecurityPolicies (→ today: PSA `restricted`, or OPA/Kyverno to require `readOnlyRootFilesystem`).
+
+#### Hands-on 2: Enforce RO-filesystem (his vim)
+**Task:** create Pod SecurityContext to make filesystem Read-Only; ensure some directories are still writeable using emptyDir volume.
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: immutable
+  name: immutable
+spec:
+  containers:
+  - image: httpd
+    name: immutable
+    securityContext:
+      readOnlyRootFilesystem: true
+    volumeMounts:
+    - name: cache-vol
+      mountPath: /usr/local/apache2/logs      # httpd needs to write its pid/logs here
+  volumes:
+  - name: cache-vol
+    emptyDir: {}
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+```
+```bash
+k logs immutable        # without emptyDir: "Read-only file system: AH00099: could not create /usr/local/apache2/logs/httpd.pid" → CrashLoop
+k exec immutable -- touch /test                           # Read-only file system ✅
+k exec immutable -- touch /usr/local/apache2/logs/test    # works (emptyDir)
+```
+Docker equivalent shown on slide: `docker run --read-only --tmpfs /run my-container`
+
+#### RBAC
+With RBAC it should be ensured that **only certain people can even edit pod specs** — otherwise anyone can just remove `readOnlyRootFilesystem`.
+
+#### Section summary
+- Immutability
+- Container image level
+- Pod level via Security Context
+- RBAC
 
 ---
+
+---
+
+### 10.3 Auditing
+
+#### Concept
+- Introduction
+- Setup and configure Audit Logs
+- Use Audit Logs to investigate access history
+
+#### Audit Logs — Introduction
+Every API request (create pod, new image for deployment, read secret) → **Kubernetes API** → **Audit Logs**. Later you query the history:
+- Did someone access an important secret while it was not protected?
+- When was the last time that user X did access cluster Y?
+- Does my CRD work properly?
+
+#### API Request Stages
+Each request can be recorded with an associated "stage":
+| Stage | When |
+|---|---|
+| `RequestReceived` | As soon as the audit handler receives the request, before it is delegated down the handler chain |
+| `ResponseStarted` | Response headers sent, body not yet. **Only for long-running requests** (e.g. watch) |
+| `ResponseComplete` | Response body completed, no more bytes will be sent |
+| `Panic` | Events generated when a panic occurred |
+
+#### Audit Policy — What data to store? (Rule LEVELS)
+Many API requests → much data to store → *What events should be recorded and what data should these contain?*
+| Level | Logs |
+|---|---|
+| `None` | don't log events that match this rule |
+| `Metadata` | request metadata (user, timestamp, resource, verb…) but **not** request/response body |
+| `Request` | metadata + **request body**, not response body (not for non-resource requests) |
+| `RequestResponse` | metadata + request **and** response bodies (not for non-resource requests) |
+
+#### Example policy (from the slides)
+```yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - "RequestReceived"
+rules:
+# log no "read" actions
+- level: None
+  verbs: ["get", "watch", "list"]
+# log nothing regarding events
+- level: None
+  resources:
+  - group: "" # core
+    resources: ["events"]
+# log nothing coming from some groups
+- level: None
+  userGroups: ["system:nodes"]
+- level: RequestResponse
+  resources:
+  - group: ""
+    resources: ["secrets"]
+# for everything else log
+- level: Metadata
+```
+> ⚠️ **Checked in order: the first matching rule sets the "audit level" of the event.** Put `None` rules first and the catch-all last.
+> ⚠️ `RequestResponse` on secrets writes **secret values into the log file** — in real life use `Metadata` for secrets.
+
+#### Audit Backends — Where to store all that data?
+- **Log** (JSON files) → ship with ElasticSearch / FileBeat / Fluentd
+- **Webhook** (external API)
+- **Dynamic backend** (AuditSink API — removed, no longer exists)
+
+#### Overview
+Event content (Pods, Secrets, "get", "delete") × **Level** (None/Metadata/Request/RequestResponse) × **Stages** (RequestReceived/ResponseStarted/ResponseComplete/Panic) → Audit Logs.
+
+#### Hands-on 1: Setup Audit Logs (JSON)
+**Task:** configure apiserver to store Audit Logs in JSON format.
+```bash
+mkdir -p /etc/kubernetes/audit
+vim /etc/kubernetes/audit/policy.yaml
+```
+```yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+- level: Metadata
+```
+Apiserver manifest (course file `course-content/runtime-security/auditing/kube-apiserver_enable_auditing.yaml`):
+```yaml
+    - --audit-policy-file=/etc/kubernetes/audit/policy.yaml       # add
+    - --audit-log-path=/etc/kubernetes/audit/logs/audit.log       # add
+    - --audit-log-maxsize=500                                     # add  (MB per file)
+    - --audit-log-maxbackup=5                                     # add  (rotated files kept)
+...
+    volumeMounts:
+    - mountPath: /etc/kubernetes/audit                            # add  (NOT readOnly — apiserver writes logs)
+      name: audit                                                 # add
+...
+  volumes:
+  - hostPath:                                                     # add
+      path: /etc/kubernetes/audit                                 # add
+      type: DirectoryOrCreate                                     # add
+    name: audit                                                   # add
+```
+```bash
+watch crictl ps
+tail -f /etc/kubernetes/audit/logs/audit.log
+```
+> ⚠️ His course file still contains `--insecure-port=0` → **delete it** on 1.24+ (unknown flag).
+
+#### Hands-on 2: Create a secret and investigate the JSON audit log
+```bash
+k create secret generic very-secure --from-literal user=admin
+cat /etc/kubernetes/audit/logs/audit.log | grep very-secure | tail -1 | jq
+```
+```json
+{
+  "kind": "Event", "apiVersion": "audit.k8s.io/v1",
+  "level": "Metadata",
+  "stage": "ResponseComplete",
+  "requestURI": "/api/v1/namespaces/default/secrets?fieldManager=kubectl-create",
+  "verb": "create",
+  "user": { "username": "kubernetes-admin", "groups": ["system:masters","system:authenticated"] },
+  "sourceIPs": ["10.156.0.25"],
+  "userAgent": "kubectl/v1.19.3 (linux/amd64) kubernetes/1e11e4a",
+  "objectRef": { "resource": "secrets", "namespace": "default", "name": "very-secure", "apiVersion": "v1" },
+  "responseStatus": { "code": 201 },
+  "annotations": { "authorization.k8s.io/decision": "allow" }
+}
+```
+Who (`user.username`), what (`verb`, `objectRef`), from where (`sourceIPs`, `userAgent`), result (`responseStatus.code`, decision).
+
+#### Hands-on 3: Restrict amount of Audit Logs to collect
+**Task:** restrict logged data with an Audit Policy:
+- Nothing from stage RequestReceived
+- Nothing from "get", "watch", "list"
+- From Secrets only metadata level
+- Everything else RequestResponse level
+```yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - "RequestReceived"
+rules:
+- level: None
+  verbs: ["get", "watch", "list"]
+- level: Metadata
+  resources:
+  - group: ""
+    resources: ["secrets"]
+- level: RequestResponse
+```
+Procedure (from slide):
+1. Change policy file
+2. Disable audit logging in apiserver, wait till restart
+3. Enable audit logging in apiserver, wait till restart
+   a. If apiserver doesn't start, check `/var/log/pods/kube-system_kube-apiserver*`
+4. Test your changes
+```bash
+k create secret generic s2 --from-literal a=b
+grep s2 /etc/kubernetes/audit/logs/audit.log | tail -1 | jq .level        # "Metadata"
+k run x --image=nginx && grep '"name":"x"' /etc/kubernetes/audit/logs/audit.log | tail -1 | jq .level   # "RequestResponse"
+```
+> Simpler restart than disable/enable: `mv /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/ && sleep 15 && mv /tmp/kube-apiserver.yaml /etc/kubernetes/manifests/`
+
+#### My lab issues (Nov 2026)
+1. **Apiserver never restarted after adding audit flags** → kubelet log:
+   `Could not process manifest file ... couldn't parse as pod(yaml: line 118: did not find expected '-' indicator)`
+   Cause: new volume indented with 3 spaces (`   - hostPath:`) instead of 2. YAML parse errors never reach `crictl logs` — only `journalctl -u kubelet`. Check before saving:
+   `python3 -c "import yaml;yaml.safe_load(open('/etc/kubernetes/manifests/kube-apiserver.yaml'))" && echo YAML-OK`
+2. **Apiserver crashed on start:**
+   `loading audit policy file: unknown group version field audit.k8s.io/__internal, Kind=Policy in policy`
+   Cause: a typo/misplaced field in `policy.yaml` (strict parsing). Fix by comparing with the known-good policy above; check for tabs with `cat -A`.
+
+#### Section summary
+- What are Audit Logs
+- How to enable them (apiserver)
+- How to filter these (Audit Policy)
+- How to investigate logs
 
 ## 11. Quick Reference
 
@@ -3309,6 +3662,107 @@ k drain <node> --ignore-daemonsets && k uncordon <node>
 
 ---
 
+### 11.1 Shell & kubectl Tricks
+
+#### Shell setup (first 30 seconds of the exam)
+```bash
+alias k=kubectl                                   # usually preset
+source <(kubectl completion bash)                 # tab-complete resources & names
+complete -o default -F __start_kubectl k          # completion for the alias too
+export do="--dry-run=client -o yaml"              # k run x --image=nginx $do > pod.yaml
+export now="--force --grace-period 0"             # k delete pod x $now
+```
+Vim (`~/.vimrc`) — so YAML indentation doesn't break:
+```
+set expandtab tabstop=2 shiftwidth=2 number
+```
+
+#### Line editing & history
+| Keys | Effect |
+|---|---|
+| `Tab Tab` | List options for a command / file / resource |
+| `Ctrl+R` | Search history (again = next match); `→` to edit, `Ctrl+G` cancel |
+| `Ctrl+A` / `Ctrl+E` | Jump to start / end of line |
+| `Alt+B` / `Alt+F` | Jump word back / forward |
+| `Ctrl+W` / `Ctrl+U` / `Ctrl+K` | Delete word back / to start / to end of line |
+| `Ctrl+Y` | Paste back what you just deleted |
+| `Ctrl+D` / `Alt+D` | Delete char / word forward |
+| `!!` / `sudo !!` | Repeat last command (with sudo) |
+| `!$` or `Alt+.` | Last argument of previous command |
+| `cd -` | Previous directory |
+| `Ctrl+L` | Clear screen |
+| `Ctrl+Z`, `fg` | Pause foreground command, resume |
+| `hash -r` | Clear bash's cached command paths (after moving/removing a binary) |
+Vim: `D` delete to end of line, `X` char before cursor, `:set backspace=indent,eol,start` if Backspace doesn't work.
+
+#### Generating YAML fast
+```bash
+k run pod1 --image=nginx $do > pod.yaml
+k create deploy d1 --image=nginx --replicas=3 $do > d.yaml
+k create secret generic s1 --from-literal=k=v $do
+k create role r1 --verb=get,list --resource=pods $do
+k expose pod pod1 --port 80 $do
+k set env deploy/x --from=secret/s1 --dry-run=client -o yaml
+k explain pod.spec.securityContext --recursive | less
+```
+
+#### Finding things
+```bash
+k get pod -A -o wide
+k get pod -A --show-labels
+k get pod -A -o jsonpath='{..image}' | tr ' ' '\n' | sort -u
+k get pod -A --sort-by=.metadata.creationTimestamp
+k api-resources --namespaced=false
+k auth can-i --list --as system:serviceaccount:ns:sa
+k get events -A --sort-by=.lastTimestamp | tail
+```
+
+#### Editing safely
+```bash
+cp /etc/kubernetes/manifests/kube-apiserver.yaml ~/apiserver.bak
+k get deploy x -o yaml > x.bak.yaml
+k replace --force -f pod.yaml
+python3 -c "import yaml;yaml.safe_load(open('f.yaml'))"
+```
+
+#### Debugging the control plane
+```bash
+watch crictl ps
+crictl ps -a | grep apiserver && crictl logs <id>
+ls /var/log/pods/kube-system_kube-apiserver-*/kube-apiserver/
+journalctl -u kubelet -f | grep -i manifest      # YAML errors only show here
+systemctl cat kubelet
+```
+
+#### Container / process forensics
+```bash
+crictl ps | grep <name> && crictl inspect <id> | grep -i pid
+ps aux | grep <proc>;  pstree -p
+ls -l /proc/<pid>/exe /proc/<pid>/fd/
+cat /proc/<pid>/environ | tr '\0' '\n'
+cat /proc/<pid>/status | grep -E "NoNewPrivs|CapEff|Seccomp"
+ls /proc/<pid>/root/
+strace -p <pid> -f -cw
+strings <binary-file> | grep <text>
+```
+
+#### Text tools
+```bash
+grep -rn "pattern" /etc/kubernetes/
+grep -v "f:"
+sed -i 's/old/new/' file
+sed -i '/--flag/d' file
+awk '{print $1}'   cut -d' ' -f1   sort -u   uniq -c   wc -l
+tail -f file | grep --line-buffered x
+base64 -d <<< "c2VjcmV0"
+openssl x509 -in cert.crt -noout -text | grep -A1 "Subject Alternative"
+sha512sum file
+jq . file.json        # pretty-print audit log lines
+```
+
+#### tmux
+`Ctrl+B %` vertical split · `Ctrl+B "` horizontal · `Ctrl+B` + arrow switch pane.
+
 ## 12. Troubleshooting Index
 Quick lookup: **error message → section**. Every entry comes from my own lab.
 
@@ -3331,6 +3785,11 @@ Quick lookup: **error message → section**. Every entry comes from my own lab.
 | `couldn't init admission plugin "ImagePolicyWebhook": no config specified` | Plugin enabled without `--admission-control-config-file` | 9.4 |
 | `pods "x" is forbidden: Post "https://external-service:1234/check-image..."` | ImagePolicyWebhook backend unreachable + `defaultAllow: false` | 9.4 |
 | `tail: cannot open '.../kube-apiserver/4.log'` | Log number changed after restart; `ls` first | 9.4 |
+| `Could not process manifest file ... did not find expected '-' indicator` | YAML indentation in static pod manifest (only in kubelet log) | 10.3 |
+| `loading audit policy file: unknown group version field ... Kind=Policy` | Typo/misplaced field in audit policy | 10.3 |
+| `AH00099: could not create .../httpd.pid` Read-only file system | readOnlyRootFilesystem without emptyDir for writable path | 10.2 |
+| `aa-`: command not found | Prefix only; install `apparmor-utils`, use Tab Tab | 7.1 |
+| `aa-genprof`: `Operation {'runbindable'} cannot have a source` / `Include file ... not found` | Shipped profiles unparseable by utils; move them aside | 7.1 |
 | Falco output has extra `container_id=… k8s_ns_name=…` fields | `append_output.suggested_output: true` in falco.yaml | 10.1 |
 | `cat <file> \| grep x` → `Binary file matches` | Use `strings` first | 10.1 |
 | `"sh": executable file not found` on `docker exec` | Shell removed in hardened image (intended) | 9.1 |
