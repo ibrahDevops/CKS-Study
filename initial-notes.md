@@ -42,6 +42,11 @@
 | 29 | Runtime Security – Auditing | 9:34:xx | Monitoring, Logging & Runtime | ✅ |
 | 30 | System Hardening – Kernel Hardening Tools (AppArmor, seccomp) | 10:06:xx | System Hardening | ✅ |
 | 31 | System Hardening – Reduce Attack Surface | 10:45:45 | System Hardening | ✅ |
+| G1 | *Gap:* Pod Security Standards deep dive (8.6) | — | Microservice Vulnerabilities | 📝 written, lab ⏳ |
+| G2 | *Gap:* Multi-tenancy isolation (8.7) | — | Microservice Vulnerabilities | 📝 written, lab ⏳ |
+| G3 | *Gap:* Cilium pod-to-pod encryption (8.8) | — | Microservice Vulnerabilities | 📝 written, lab ⏳ |
+| G4 | *Gap:* SBOM (9.5) | — | Supply Chain | 📝 written, lab ⏳ |
+| G5 | *Gap:* cosign + KubeLinter (9.6) | — | Supply Chain | 📝 written, lab ⏳ |
 
 🎓 **All chapters done.** Next: killercoda CKS scenarios → killer.sh session 1 → fix weak areas → killer.sh session 2 → exam.
 
@@ -76,6 +81,9 @@
    - [8.3 OS Level Security Domains](#83-os-level-security-domains)
    - [8.4 mTLS](#84-mtls--mutual-tls)
    - [8.5 OPA Gatekeeper](#85-open-policy-agent-opa--gatekeeper)
+   - [8.6 Pod Security Standards deep dive](#86-pod-security-standards-pss--pod-security-admission--deep-dive)
+   - [8.7 Isolation — Multi-Tenancy](#87-isolation-techniques--multi-tenancy)
+   - [8.8 Pod-to-Pod Encryption with Cilium](#88-pod-to-pod-encryption-with-cilium-and-istio)
    - [8.x etcd Encryption at Rest — Lab Incident & Recovery](#8x-etcd-encryption-at-rest--lab-incident--recovery-from-my-lab-nov-2026)
    - [8.y Container Runtime Sandbox (gVisor) — Lab Incident](#8y-container-runtime-sandbox-gvisor--runtimeclass--lab-incident--recovery-from-my-lab-nov-2026)
    - [8.z anonymous-auth restart loop](#8z-related-incident---anonymous-authfalse--apiserver-restart-loop)
@@ -85,6 +93,8 @@
    - [9.2 Static Analysis (kubesec, conftest)](#92-static-analysis-of-user-workloads)
    - [9.3 Image Vulnerability Scanning (Trivy)](#93-scan-images-for-known-vulnerabilities)
    - [9.4 Secure Supply Chain](#94-secure-supply-chain)
+   - [9.5 SBOM](#95-sbom--software-bill-of-materials)
+   - [9.6 cosign & KubeLinter](#96-sign--verify-images-cosign--kubelinter)
 10. [Domain 6 — Monitoring, Logging & Runtime Security](#10-domain-6--monitoring-logging--runtime-security)
    - [10.1 Behavioral Analytics (strace, /proc, Falco)](#101-behavioral-analytics-at-host-and-container-level)
    - [10.2 Immutability of Containers](#102-immutability-of-containers-at-runtime)
@@ -1826,7 +1836,7 @@ deluser <user>; usermod -s /usr/sbin/nologin <user>   # remove / lock
 🎓 **Course complete — Killer Shell CKS Full Course (11:06:39) fully documented.**
 
 ## 8. Domain 4 — Minimize Microservice Vulnerabilities
-*Not covered by the video (current curriculum): Cilium transparent encryption (WireGuard/IPsec) — study from cilium.io docs.*
+*Sections 8.6–8.8 are curriculum gap sections written from current docs (not in the video).*
 
 ### 8.1 Manage Kubernetes Secrets
 
@@ -2570,6 +2580,284 @@ INPUT `{"message": "world"}` → OUTPUT `{"hello": true}`. Change the input to `
 - Rego
 
 
+### 8.6 Pod Security Standards (PSS) & Pod Security Admission — deep dive
+*Curriculum gap section (not in the video). Replaces PSP (removed 1.25).*
+
+#### Levels
+| Level | Blocks (summary) |
+|---|---|
+| `privileged` | Nothing |
+| `baseline` | `privileged: true`, `hostNetwork/hostPID/hostIPC`, `hostPath` volumes, `hostPort`, adding capabilities beyond the default set (e.g. `SYS_ADMIN`, `NET_ADMIN`), AppArmor/seccomp `Unconfined`, unsafe sysctls, `/proc` mount type Unmasked |
+| `restricted` | Everything in baseline **plus** must set: `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]` (only `NET_BIND_SERVICE` may be added), `seccompProfile.type: RuntimeDefault` or `Localhost`; volumes limited to configMap, csi, downwardAPI, emptyDir, ephemeral, PVC, projected, secret; no `runAsUser: 0` |
+
+#### Modes (namespace labels, can be combined)
+| Label | Effect |
+|---|---|
+| `pod-security.kubernetes.io/enforce=<level>` | **Reject** violating pods |
+| `pod-security.kubernetes.io/warn=<level>` | Allow, but **warning** shown to the user |
+| `pod-security.kubernetes.io/audit=<level>` | Allow, annotation in **audit log** |
+| `...-version=<v1.xx\|latest>` | Pin the standard version (e.g. `enforce-version=latest`) |
+
+> PSA checks **pods**, but `warn`/`audit` also fire on Deployments etc. With `enforce`, a Deployment is **created fine** but its ReplicaSet can't create pods → check `k describe rs` / `k get events`.
+
+#### Hands-on 1: Enforce baseline, warn restricted
+```bash
+k create ns team-a
+k label ns team-a pod-security.kubernetes.io/enforce=baseline pod-security.kubernetes.io/warn=restricted
+k -n team-a run priv --image=nginx --privileged
+# Error from server (Forbidden): pods "priv" is forbidden: violates PodSecurity "baseline:latest": privileged (container "priv" must not set securityContext.privileged=true)
+k -n team-a run plain --image=nginx
+# Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false, unrestricted capabilities, runAsNonRoot != true, seccompProfile ...
+# pod/plain created    ← allowed (baseline OK), only warned for restricted
+```
+
+#### Hands-on 2: Deployment trap
+```bash
+k -n team-a create deploy hostnet --image=nginx $do > d.yaml   # add spec.template.spec.hostNetwork: true
+k -n team-a apply -f d.yaml                                     # deployment.apps/hostnet created  (!)
+k -n team-a get pod                                             # nothing
+k -n team-a get events --sort-by=.lastTimestamp | tail -3       # FailedCreate ... violates PodSecurity "baseline:latest": host namespaces (hostNetwork=true)
+```
+
+#### Hands-on 3: Make a pod pass `restricted`
+```bash
+k label ns team-a pod-security.kubernetes.io/enforce=restricted --overwrite
+```
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ok
+  namespace: team-a
+spec:
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: app
+    image: nginxinc/nginx-unprivileged     # stock nginx runs as root → CreateContainerConfigError with runAsNonRoot
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+```
+```bash
+k apply -f ok.yaml && k -n team-a get pod ok     # Running
+```
+
+#### Hands-on 4: Dry-run a level against existing workloads (before enforcing)
+```bash
+k label --dry-run=server --overwrite ns --all pod-security.kubernetes.io/enforce=restricted
+# Warning: existing pods in namespace "default" violate the new PodSecurity enforce level "restricted:latest" ...
+```
+
+#### Hands-on 5: Cluster-wide default (AdmissionConfiguration)
+`/etc/kubernetes/admission/admission_config.yaml` — one file can hold several plugins (e.g. ImagePolicyWebhook + PodSecurity):
+```yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+- name: PodSecurity
+  configuration:
+    apiVersion: pod-security.admission.config.k8s.io/v1
+    kind: PodSecurityConfiguration
+    defaults:
+      enforce: baseline
+      enforce-version: latest
+      audit: restricted
+      audit-version: latest
+      warn: restricted
+      warn-version: latest
+    exemptions:
+      usernames: []
+      runtimeClasses: []
+      namespaces: [kube-system]
+```
+apiserver: `--admission-control-config-file=/etc/kubernetes/admission/admission_config.yaml` **+ volumeMount + hostPath** (same rule as always). Namespace labels override the defaults.
+
+> Exam patterns: "pods in ns X must not run privileged" → label `enforce=baseline`; "delete pods violating …" → label, then `k delete pod` and watch which are rejected on recreate; "find why deployment has 0 pods" → events/RS.
+
+---
+
+### 8.7 Isolation Techniques — Multi-Tenancy
+*Curriculum gap section. "Understand and implement isolation techniques (multi-tenancy, sandboxed containers, etc.)" — sandboxes are in 8.2/8.y.*
+
+#### Layers of tenant isolation
+| Layer | Tool |
+|---|---|
+| API / control plane | Namespace per tenant + **RBAC** RoleBindings scoped to that ns (6.1) |
+| Resources (noisy neighbour, DoS) | **ResourceQuota** + **LimitRange** |
+| Network | Default-deny **NetworkPolicy** per ns, allow only own ns (5.1) |
+| Workload privileges | **PSA** label per ns (8.6) |
+| Kernel | **RuntimeClass** gVisor/Kata for untrusted tenants (8.2) |
+| Nodes | Dedicated nodes: **taint** + **node-restriction.kubernetes.io/** label + nodeSelector (6.4) |
+
+#### Hands-on 1: Tenant namespaces + RBAC
+```bash
+k create ns tenant-a && k create ns tenant-b
+k -n tenant-a create rolebinding tenant-a-admin --clusterrole=admin --user=jane
+k auth can-i create pods -n tenant-a --as jane     # yes
+k auth can-i create pods -n tenant-b --as jane     # no
+```
+
+#### Hands-on 2: ResourceQuota + LimitRange
+```bash
+k -n tenant-a create quota tenant-a-quota --hard=pods=5,requests.cpu=1,requests.memory=1Gi,limits.cpu=2,limits.memory=2Gi
+k -n tenant-a run p1 --image=nginx
+# Error from server (Forbidden): pods "p1" is forbidden: failed quota: tenant-a-quota: must specify limits.cpu for: p1; limits.memory for: p1; requests.cpu ...
+```
+Fix: give defaults via LimitRange so pods without resources are accepted:
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: tenant-a
+spec:
+  limits:
+  - type: Container
+    default:          { cpu: 200m, memory: 256Mi }   # limits
+    defaultRequest:   { cpu: 100m, memory: 128Mi }   # requests
+    max:              { cpu: "1",  memory: 1Gi }
+```
+```bash
+k apply -f lr.yaml && k -n tenant-a run p1 --image=nginx    # created
+k -n tenant-a describe quota                                 # Used vs Hard
+for i in 2 3 4 5 6; do k -n tenant-a run p$i --image=nginx; done   # p6 → exceeded quota: pods=5
+```
+
+#### Hands-on 3: Namespace network isolation
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: same-ns-only
+  namespace: tenant-a
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+  - from:
+    - podSelector: {}                 # only pods from tenant-a
+  egress:
+  - to:
+    - podSelector: {}
+  - ports:                            # DNS
+    - { port: 53, protocol: UDP }
+    - { port: 53, protocol: TCP }
+```
+```bash
+k -n tenant-b run t --image=curlimages/curl -- sleep 1d
+k -n tenant-b exec t -- curl -m2 <tenant-a-pod-ip>      # timeout ✅
+```
+
+#### Hands-on 4: Dedicated node for a tenant
+```bash
+k taint node cks-worker tenant=a:NoSchedule
+k label node cks-worker node-restriction.kubernetes.io/tenant=a    # kubelet can't self-assign this prefix (NodeRestriction)
+```
+```yaml
+spec:
+  nodeSelector:
+    node-restriction.kubernetes.io/tenant: a
+  tolerations:
+  - key: tenant
+    value: a
+    effect: NoSchedule
+```
+```bash
+k taint node cks-worker tenant=a:NoSchedule-       # cleanup (single-worker lab!)
+```
+> Why the special prefix: a compromised kubelet could label *its own* node `tenant=a` and attract tenant-a workloads; with `node-restriction.kubernetes.io/` it can't.
+
+---
+
+### 8.8 Pod-to-Pod Encryption with Cilium (and Istio)
+*Curriculum gap section. "Implement Pod-to-Pod encryption (Cilium, Istio)".*
+
+#### Concepts
+| | Cilium transparent encryption | Istio mTLS |
+|---|---|---|
+| Where | CNI / kernel (node ↔ node tunnel) | Sidecar / ztunnel proxy per pod |
+| Encrypts | Pod traffic **between nodes** (same-node traffic is not encrypted) | Every connection between meshed workloads |
+| Identity/authN | No workload identity | Yes — SPIFFE certs per ServiceAccount |
+| Options | **WireGuard** (keys auto-generated/rotated, iface `cilium_wg0`, UDP **51871**) or **IPsec** (you create a key Secret, ESP traffic) |
+| App change | None | None (sidecar injection) |
+
+#### ⚠️ Lab prep — my cluster runs Weave
+Cilium must be the CNI. Do this on a **fresh/throwaway cluster** (or at the end), not mid-study:
+```bash
+# master: remove weave
+k -n kube-system delete ds weave-net
+# every node:
+rm -f /etc/cni/net.d/*weave* && ip link delete weave 2>/dev/null; systemctl restart kubelet
+```
+AWS security group between nodes must allow: **UDP 8472** (VXLAN), **TCP 4240** (health), **UDP 51871** (WireGuard), or IP protocol **50/ESP** (IPsec). Easiest: allow all traffic from the same SG.
+
+Install the cilium CLI (master):
+```bash
+CLI=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt); curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CLI}/cilium-linux-amd64.tar.gz && tar xzvf cilium-linux-amd64.tar.gz -C /usr/local/bin && rm cilium-linux-amd64.tar.gz
+```
+
+#### Hands-on 1: Install Cilium with WireGuard encryption
+```bash
+cilium install --set encryption.enabled=true --set encryption.type=wireguard
+cilium status --wait
+k -n kube-system delete pod -l k8s-app=kube-dns          # restart CoreDNS on the new CNI
+k -n kube-system exec ds/cilium -- cilium-dbg status | grep Encryption
+# Encryption: Wireguard   [NodeEncryption: Disabled, cilium_wg0 (Pubkey: ..., Port: 51871, Peers: 1)]
+cilium encryption status                                  # newer CLI versions
+```
+Already-installed Cilium (exam-style "enable encryption"):
+```bash
+cilium upgrade --reuse-values --set encryption.enabled=true --set encryption.type=wireguard
+# or Helm: helm upgrade cilium cilium/cilium -n kube-system --reuse-values --set encryption.enabled=true --set encryption.type=wireguard
+k -n kube-system rollout restart ds/cilium
+```
+
+#### Hands-on 2: Prove traffic is encrypted
+Pods must be on **different nodes**:
+```bash
+k run srv --image=nginx                                                        # lands on worker
+k run cli --image=curlimages/curl --overrides='{"spec":{"nodeName":"cks-master"}}' -- sleep 1d
+k get pod -o wide                                                              # srv IP, nodes differ
+# on the worker (find iface: ip -br a → ens5 on EC2)
+tcpdump -ni ens5 udp port 51871                       # WireGuard packets appear while curling ✅
+tcpdump -ni ens5 -A tcp port 80 | grep -i "welcome"   # nothing in plaintext ✅
+# master:
+k exec cli -- curl -s <srv-ip> | head -3
+```
+Before enabling encryption the same `tcpdump -A` shows the nginx HTML (inside VXLAN on UDP 8472).
+
+#### Hands-on 3: IPsec variant
+```bash
+k -n kube-system create secret generic cilium-ipsec-keys --from-literal=keys="3+ rfc4106(gcm(aes)) $(dd if=/dev/urandom count=20 bs=1 2>/dev/null | xxd -p -c 64) 128"
+cilium install --set encryption.enabled=true --set encryption.type=ipsec
+k -n kube-system exec ds/cilium -- cilium-dbg encrypt status      # Encryption: IPsec, keys in use
+tcpdump -ni ens5 esp                                               # ESP packets ✅
+```
+> IPsec: you own the key + rotation (update Secret with incremented SPI). WireGuard: automatic.
+> Node-to-node (host) traffic is only encrypted with `--set encryption.nodeEncryption=true` (WireGuard).
+
+#### Istio quick reference (if the task uses a mesh)
+```bash
+k label ns team-a istio-injection=enabled        # sidecar injection for new pods
+```
+```yaml
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: team-a           # or istio-system = mesh-wide
+spec:
+  mtls:
+    mode: STRICT              # PERMISSIVE = accept plaintext too
+```
+Remember from 8.4: sidecar/init container needs `NET_ADMIN` to set iptables redirect rules.
+
+---
+
 ### 8.x etcd Encryption at Rest — Lab Incident & Recovery (from my lab, Nov 2026)
 
 #### Provider rules (memorise these)
@@ -2789,7 +3077,7 @@ The apiserver's startup/liveness/readiness probes (`/livez`, `/readyz`) are **an
 Fix: remove the flag (`sed -i '/--anonymous-auth=false/d' /etc/kubernetes/manifests/kube-apiserver.yaml`). To keep anonymous off properly, use an `AuthenticationConfiguration` that allows anonymous **only** for `/livez`, `/readyz` and `/healthz`.
 
 ## 9. Domain 5 — Supply Chain Security
-*Not covered by the video (current curriculum): SBOM (`trivy image --format cyclonedx`, `bom`), image signing (cosign) — study from docs.*
+*Sections 9.5–9.6 are curriculum gap sections written from current docs (not in the video).*
 
 ### 9.1 Image Footprint
 
@@ -3361,6 +3649,84 @@ Example real backend: https://github.com/flavio/kube-image-bouncer
 - Image tags and digests
 - Whitelist registries with OPA
 - ImagePolicyWebhook
+
+### 9.5 SBOM — Software Bill of Materials
+*Curriculum gap section. "Understand your supply chain (e.g. SBOM, CI/CD, artifact repositories)".*
+
+#### Concept
+- SBOM = machine-readable **inventory of every component** (OS packages, libraries + versions, licenses) in an image/artifact.
+- Answers "**are we affected by CVE-X / package-Y?**" without re-pulling and re-scanning every image.
+- Formats: **SPDX** (Linux Foundation, `.spdx` / `.spdx.json`) and **CycloneDX** (OWASP, `.cdx.json`).
+- Workflow: **build → generate SBOM → (sign/attach to image) → store → scan SBOM for CVEs continuously**.
+- Tools: **trivy** (generate + scan), **bom** (k8s-sigs, SPDX), syft/grype.
+
+#### Hands-on 1: Generate SBOMs with Trivy
+```bash
+trivy image --format cyclonedx --output nginx.cdx.json nginx:1.25
+trivy image --format spdx-json --output nginx.spdx.json nginx:1.25
+jq '.components | length' nginx.cdx.json                                         # number of components
+jq -r '.components[] | "\(.name) \(.version)"' nginx.cdx.json | grep -i openssl  # find a package + version
+```
+
+#### Hands-on 2: Scan the SBOM (not the image)
+```bash
+trivy sbom nginx.cdx.json
+trivy sbom --severity CRITICAL -q nginx.spdx.json
+```
+
+#### Hands-on 3: `bom` (kubernetes-sigs) — SPDX
+```bash
+curl -L -o /usr/local/bin/bom https://github.com/kubernetes-sigs/bom/releases/latest/download/bom-amd64-linux && chmod +x /usr/local/bin/bom
+bom generate --image registry.k8s.io/kube-apiserver:v1.37.1 --format json --output apiserver.spdx.json
+bom document outline apiserver.spdx.json | head -40          # tree of packages
+bom document outline apiserver.spdx.json | grep -i <pkg>
+```
+
+> Exam patterns: "Which of these 3 images contains `libcrypto3` version X? Generate an SPDX SBOM of image Y to `/opt/x.spdx`. Scan the given SBOM and write CRITICAL CVEs to a file." → know `trivy image --format`, `trivy sbom`, `bom generate`, `bom document outline`.
+
+---
+
+### 9.6 Sign & Verify Images (cosign) + KubeLinter
+*Curriculum gap section. "Secure your supply chain: … sign and validate artifacts" / static analysis.*
+
+#### cosign — key-based signing
+Lab uses **ttl.sh** (free anonymous registry, images expire) so no account is needed:
+```bash
+# install
+curl -LO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && install -m 755 cosign-linux-amd64 /usr/local/bin/cosign
+# key pair (empty password for the lab)
+COSIGN_PASSWORD="" cosign generate-key-pair               # → cosign.key, cosign.pub
+# push an image
+docker pull nginx:1.25 && docker tag nginx:1.25 ttl.sh/ibra-nginx:1h && docker push ttl.sh/ibra-nginx:1h
+DIGEST=$(docker inspect --format='{{index .RepoDigests 1}}' ttl.sh/ibra-nginx:1h); echo $DIGEST    # sign by DIGEST, not tag
+# sign + verify
+COSIGN_PASSWORD="" cosign sign --yes --key cosign.key $DIGEST
+cosign verify --key cosign.pub $DIGEST | jq        # "The cosign claims were validated" ✅
+cosign verify --key cosign.pub ttl.sh/ibra-nginx-unsigned:1h   # Error: no matching signatures
+```
+> Use `docker inspect ... RepoDigests` and pick the ttl.sh entry (index may be 0 or 1).
+> Attach an SBOM as attestation: `cosign attest --yes --key cosign.key --type cyclonedx --predicate nginx.cdx.json $DIGEST`; verify with `cosign verify-attestation --key cosign.pub --type cyclonedx $DIGEST`.
+
+**Enforcing in-cluster** (concept): an admission controller verifies signatures before pods start — **Kyverno** `verifyImages`, **sigstore policy-controller**, or ImagePolicyWebhook backend (9.4). Combined with the registry allow-list (OPA, 9.4) and digests.
+
+#### KubeLinter — static analysis of YAML/Helm
+```bash
+curl -LO https://github.com/stackrox/kube-linter/releases/latest/download/kube-linter-linux.tar.gz && tar xzf kube-linter-linux.tar.gz -C /usr/local/bin kube-linter
+k run nginx --image=nginx $do > pod.yaml
+kube-linter lint pod.yaml
+# pod.yaml: (object: <no namespace>/nginx /v1, Kind=Pod) container "nginx" does not have a read-only root file system (check: no-read-only-root-fs, remediation: ...)
+# ... run-as-non-root, unset-cpu-requirements, unset-memory-requirements, latest-tag ...
+kube-linter checks list | less
+```
+Fix the findings (readOnlyRootFilesystem, runAsNonRoot, resources, image tag) → re-run until `No lint errors found!`.
+
+| Tool | Checks | Language |
+|---|---|---|
+| kubesec | Score-based security risk of k8s YAML | fixed rules |
+| KubeLinter | Lint k8s YAML/Helm against best-practice checks | fixed + configurable |
+| conftest | Your own policies on any JSON/YAML/Dockerfile | Rego |
+
+---
 
 ## 10. Domain 6 — Monitoring, Logging & Runtime Security
 
@@ -3995,6 +4361,18 @@ sha512sum file
 jq . file.json        # pretty-print audit log lines
 ```
 
+#### Gap-topic one-liners
+```bash
+k label ns <ns> pod-security.kubernetes.io/enforce=restricted --overwrite
+k label --dry-run=server --overwrite ns --all pod-security.kubernetes.io/enforce=restricted
+k -n <ns> create quota q --hard=pods=5,requests.cpu=1,limits.memory=2Gi
+k -n kube-system exec ds/cilium -- cilium-dbg status | grep Encryption
+trivy image --format cyclonedx --output x.cdx.json <img> ; trivy sbom x.cdx.json
+bom generate --image <img> --format json --output x.spdx.json ; bom document outline x.spdx.json
+cosign verify --key cosign.pub <img@sha256:...>
+kube-linter lint pod.yaml
+```
+
 #### systemctl / services (Reduce Attack Surface)
 ```bash
 systemctl status <svc>                                   # running? which unit + drop-ins loaded
@@ -4039,6 +4417,13 @@ Quick lookup: **error message → section**. Every entry comes from my own lab.
 | `cannot create /dev/null: Permission denied` (nginx entrypoint) | Restrictive AppArmor profile active (intended) | 7.1 |
 | `OCI runtime start failed: cannot start an already running container` | seccomp profile missing a needed syscall (e.g. `write`) | 7.1 |
 | `Warning: Stopping X.service, but it can still be activated by: X.socket` | Socket activation; also stop+disable the socket | 7.2 |
+| `violates PodSecurity "baseline:latest": ...` | PSA namespace label rejects pod | 8.6 |
+| Deployment created but 0 pods, event `FailedCreate ... violates PodSecurity` | PSA enforce blocks ReplicaSet pods | 8.6 |
+| `failed quota: ... must specify limits.cpu` | ResourceQuota without LimitRange defaults | 8.7 |
+| `exceeded quota: ... pods=5` | Quota reached | 8.7 |
+| `cilium-dbg status` → `Encryption: Disabled` | encryption.enabled not set / agents not restarted | 8.8 |
+| WireGuard on, but no UDP 51871 in tcpdump | Pods on same node, or SG blocks 51871 | 8.8 |
+| `cosign verify`: `no matching signatures` | Unsigned image / wrong key / signed tag vs digest | 9.6 |
 | `aa-`: command not found | Prefix only; install `apparmor-utils`, use Tab Tab | 7.1 |
 | `aa-genprof`: `Operation {'runbindable'} cannot have a source` / `Include file ... not found` | Shipped profiles unparseable by utils; move them aside | 7.1 |
 | Falco output has extra `container_id=… k8s_ns_name=…` fields | `append_output.suggested_output: true` in falco.yaml | 10.1 |
