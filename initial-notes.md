@@ -40,7 +40,10 @@
 | 27 | Runtime Security – Behavioral Analytics at host and container level | 8:30:xx | Monitoring, Logging & Runtime | ✅ |
 | 28 | Runtime Security – Immutability of containers at runtime | 9:17:xx | Monitoring, Logging & Runtime | ✅ |
 | 29 | Runtime Security – Auditing | 9:34:xx | Monitoring, Logging & Runtime | ✅ |
-| 30 | System Hardening – Kernel Hardening Tools (AppArmor, seccomp) | 10:06:xx | System Hardening | ⏳ |
+| 30 | System Hardening – Kernel Hardening Tools (AppArmor, seccomp) | 10:06:xx | System Hardening | ✅ |
+| 31 | System Hardening – Reduce Attack Surface | 10:45:45 | System Hardening | ✅ |
+
+🎓 **All chapters done.** Next: killercoda CKS scenarios → killer.sh session 1 → fix weak areas → killer.sh session 2 → exam.
 
 ---
 
@@ -66,6 +69,7 @@
    - [6.5 Upgrade Kubernetes](#65-upgrade-kubernetes-update-frequently)
 7. [Domain 3 — System Hardening](#7-domain-3--system-hardening)
    - [7.1 Kernel Hardening Tools (AppArmor & seccomp)](#71-kernel-hardening-tools-apparmor--seccomp)
+   - [7.2 Reduce Attack Surface](#72-reduce-attack-surface-minimize-os-footprint)
 8. [Domain 4 — Minimize Microservice Vulnerabilities](#8-domain-4--minimize-microservice-vulnerabilities)
    - [8.1 Manage Kubernetes Secrets](#81-manage-kubernetes-secrets)
    - [8.2 Container Runtime Sandboxes](#82-container-runtime-sandboxes)
@@ -1504,7 +1508,6 @@ Every new file/dir you point an apiserver flag at needs **flag + volumeMount + h
 Debug a broken apiserver: `crictl ps -a | grep apiserver` → `crictl logs <id>`, or `ls /var/log/pods/kube-system_kube-apiserver-*/`.
 
 ## 7. Domain 3 — System Hardening
-*Still TODO: AppArmor hands-on (Docker & K8s), seccomp, reduce host OS footprint, IAM*
 
 ### 7.1 Kernel Hardening Tools (AppArmor & seccomp)
 
@@ -1579,19 +1582,251 @@ mv /root/aa-bak/passt /root/aa-bak/pasta /etc/apparmor.d/abstractions/ && mv /ro
 ```
 > Loaded profiles stay active in the kernel while files are moved. Exam: you'll use `apparmor_parser`, rarely `aa-genprof`.
 
-#### Hands-on 2: AppArmor & Docker / K8s
-*Task: Nginx Docker container uses AppArmor profile — TODO, next screenshots.*
-K8s preview (1.30+):
+#### Hands-on 2: Nginx Docker container uses AppArmor profile (his terminal)
+```bash
+aa-status                      # "6 processes are in enforce mode: ... docker-default (5818) ..."
+docker run nginx                                            # runs (docker-default profile applied automatically)
+docker run --security-opt apparmor=docker-default nginx     # same, explicit
+docker run --security-opt apparmor=docker-nginx nginx       # custom restrictive profile:
+# /docker-entrypoint.sh: 13: cannot create /dev/null: Permission denied
+# /docker-entrypoint.sh: No files found in /docker-entrypoint.d/, skipping configuration
+```
+Profile file from the k8s docs example (`docker-nginx`), loaded first with `apparmor_parser /etc/apparmor.d/docker-nginx`.
+> Docker loads `docker-default` for every container. With containerd/k8s the equivalent is `RuntimeDefault`.
+
+#### AppArmor & Kubernetes — requirements
+- Container runtime needs to support AppArmor
+- AppArmor needs to be installed on every node
+- AppArmor profiles need to be available on every node
+- AppArmor profiles are **specified per container** — video: done using annotations
+
+#### Hands-on 3: Create pod which uses an AppArmor profile
+Video (old, annotation — **deprecated**, removed from being honoured in newer versions):
 ```yaml
+metadata:
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/<container-name>: localhost/docker-nginx
+```
+**Current (k8s 1.30+) — use this in the exam:**
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure
 spec:
-  securityContext:
-    appArmorProfile:
-      type: Localhost
-      localhostProfile: <profile-name>     # profile must be loaded on the node running the pod
+  nodeName: cks-worker                 # profile is loaded only on this node
+  containers:
+  - name: c1
+    image: nginx
+    securityContext:
+      appArmorProfile:
+        type: Localhost                # Localhost | RuntimeDefault | Unconfined
+        localhostProfile: docker-nginx # name INSIDE the profile file (profile <name> ...), not the filename
+```
+```bash
+apparmor_parser -q /etc/apparmor.d/docker-nginx     # on the worker
+aa-status | grep docker-nginx
+k apply -f pod.yaml && k get pod secure             # Running, or Blocked if profile missing on node
+k exec secure -- cat /proc/1/attr/current           # → docker-nginx (enforce)
+```
+> Wrong/missing profile → pod status `Blocked` / `CreateContainerError: ... apparmor profile not found`.
+
+---
+
+#### Seccomp
+- "secure computing mode"
+- Security facility in the Linux Kernel
+- Restricts execution of syscalls
+
+**Strict mode (original):** only `exit()`, `sigreturn()`, `read()`, `write()` allowed → anything else (e.g. `exec()`, `getpid()`) = **SIGKILL**.
+
+Example from slides (strict mode in C):
+```c
+printf("Step 1: no restrictions yet\n");
+prctl (PR_SET_SECCOMP, SECCOMP_MODE_STRICT);
+printf ("Step 2: entering the strict mode. Only read(), write(), exit() and sigreturn() syscalls are allowed\n");
+pid = getpid ();                                    // → killed here
+printf ("!!YOU SHOULD NOT SEE THIS!! My PID = %d", pid);
+```
+**Filter mode (seccomp-bpf):** combined with a BPF filter → custom allow-lists:
+```c
+scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_KILL);                  // default action: kill
+seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
+seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
+seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(sigreturn), 0);
+seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
+seccomp_load(ctx);
+pid = getpid();                                                     // → killed
 ```
 
+#### Hands-on 4: Nginx Docker container uses seccomp profile (his terminal)
+```bash
+vim default.json        # Docker's default seccomp profile (from k8s docs / moby repo)
+docker run nginx                                        # works
+docker run --security-opt seccomp=default.json nginx    # works (same as default)
+vim default.json        # remove "write" from the allowed syscalls
+docker run --security-opt seccomp=default.json nginx
+# docker: Error response from daemon: OCI runtime start failed: cannot start an already running container: unknown.
+```
+→ Without `write` the runtime can't even start the container.
+
+Profile structure:
+```json
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "architectures": ["SCMP_ARCH_X86_64"],
+  "syscalls": [
+    { "names": ["accept4","epoll_wait","pselect6","futex","read","write", "..."], "action": "SCMP_ACT_ALLOW" }
+  ]
+}
+```
+Actions: `SCMP_ACT_ALLOW` · `SCMP_ACT_ERRNO` (deny with error) · `SCMP_ACT_KILL` · `SCMP_ACT_LOG` (allow + log, like AppArmor complain).
+
+#### Hands-on 5: Create a Nginx Pod in Kubernetes and assign a seccomp profile
+Kubelet looks for profiles in **`/var/lib/kubelet/seccomp/`** (the `--seccomp-profile-root`, default). `localhostProfile` is **relative** to it.
+```bash
+# on the worker
+mkdir -p /var/lib/kubelet/seccomp/profiles
+cp default.json /var/lib/kubelet/seccomp/profiles/default.json
+```
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure
+spec:
+  securityContext:
+    seccompProfile:
+      type: Localhost                          # Localhost | RuntimeDefault | Unconfined
+      localhostProfile: profiles/default.json  # relative to /var/lib/kubelet/seccomp/
+  containers:
+  - name: secure
+    image: nginx
+```
+```bash
+k apply -f pod.yaml && k get pod secure
+k exec secure -- grep Seccomp /proc/1/status        # Seccomp: 2 = filter active
+```
+> Wrong path → `CreateContainerError: ... cannot load seccomp profile ... no such file or directory`.
+> Easiest secure default (PSA restricted requires it): `seccompProfile: {type: RuntimeDefault}`.
+> Video used annotation `seccomp.security.alpha.kubernetes.io/pod: localhost/default.json` — **removed in 1.27**, use the field.
+
+#### Section summary
+- Syscalls
+- AppArmor
+- Seccomp
+- Docker & K8s
+
+---
+
+### 7.2 Reduce Attack Surface (Minimize OS Footprint)
+
+#### Concept
+- Host OS footprint
+- IAM roles
+- Network access
+
+#### Overview
+| Area | Do |
+|---|---|
+| **Applications** | Keep up to date · update Linux kernel · remove not needed packages |
+| **Network** | Network behind firewall · check and close open ports |
+| **IAM** | Run as user, not root · restrict user permissions |
+
+#### Nodes that run Kubernetes
+- **Only purpose:** run Kubernetes components → remove unnecessary services
+- **Node recycling:** nodes should be ephemeral, created from images, can be recycled any time (and fast if necessary)
+
+#### Linux distributions
+- Often include number of services
+- Meant to help, but widen attack surface
+- The more existing and running services, the more convenient (for attackers too)
+
+#### Tools — slides
+**Open ports:** `netstat` (Red Hat: `ss` command)
+```bash
+netstat -plnt            # or: ss -plnt   (p=process, l=listening, n=numeric, t=tcp)
+# 0.0.0.0:22 sshd · 127.0.0.1:2379 etcd · 0.0.0.0:31331 kube-proxy (NodePort) · 127.0.0.1:10248 kubelet ...
+```
+Look for anything on **0.0.0.0 / :::** (all interfaces) that isn't Kubernetes.
+
+**Port used by which application?** `netstat` or `lsof`
+```bash
+netstat -plnt | grep 22     # 0.0.0.0:22 ... 1539/sshd
+lsof -i :22                 # sshd 1539 root 3u IPv4 ... TCP *:ssh (LISTEN)
+```
+**Running services:** `systemctl`
+```bash
+systemctl status kubelet    # Loaded: /lib/systemd/system/kubelet.service; Drop-In: .../kubelet.service.d/10-kubeadm.conf
+```
+**Processes and users:** `ps aux`
+
+#### Hands-on 1: Disable service snapd via systemctl (his terminal)
+```bash
+systemctl status snapd                         # active (running)
+systemctl stop snapd
+# Warning: Stopping snapd.service, but it can still be activated by: snapd.socket
+systemctl list-units | grep snapd              # snap-snapd-*.mount, snapd.apparmor.service, snapd.socket
+systemctl list-units --type=service | grep snapd
+systemctl list-units --type=service --state=running | grep snapd   # empty → stopped
+systemctl start snapd                          # back to running
+```
+Properly disable (stop **and** survive reboot, incl. the socket):
+```bash
+systemctl stop snapd snapd.socket && systemctl disable snapd snapd.socket
+# hard way: systemctl mask snapd   (cannot be started at all)
+```
+> ⚠️ `stop` alone ≠ disabled: **socket activation** restarts it on demand, and `enabled` restarts it after reboot. Always `stop` + `disable` (same lesson as the cri-dockerd `enable` issue in CKA).
+
+#### Hands-on 2: Install and investigate services (his terminal)
+```bash
+apt-get install -y samba vsftpd     # (course installs services to find)
+systemctl start smbd
+ps aux | grep smbd                  # /usr/sbin/smbd --foreground --no-process-group (several processes)
+netstat -plnt
+# 0.0.0.0:445  8277/smbd    ← exposed on all interfaces
+# 0.0.0.0:139  8277/smbd
+# :::21        7668/vsftpd
+```
+
+#### Hands-on 3: Remove FTP server — find and disable the application listening on port 21 (his terminal)
+```bash
+netstat -plnt | grep 21             # :::21 ... 7668/vsftpd   (also matches 9421/smbd — grep matches the PID!)
+lsof -i :21                         # vsftpd 7668 root 3u IPv6 ... TCP *:ftp (LISTEN)
+systemctl list-units --type service | grep ftp     # vsftpd.service loaded active running vsftpd FTP server
+systemctl status vsftpd             # CGroup: └─7668 /usr/sbin/vsftpd /etc/vsftpd.conf
+systemctl stop vsftpd
+systemctl status vsftpd             # inactive (dead) ... code=killed, signal=TERM
+systemctl disable vsftpd            # Synchronizing state ... systemd-sysv-install disable vsftpd
+netstat -plnt | grep 21             # only smbd lines left (PID 9421 contains "21")
+lsof -i :21                         # nothing → port free ✅
+```
+> Exam pattern: port → `lsof -i :<port>` / `ss -plnt` → process → `systemctl list-units | grep` → `stop` + `disable` (or `apt remove`). If it's not a service: find binary via `ls -l /proc/<pid>/exe` and delete it.
+
+#### Hands-on 4: Investigate Linux users
+```bash
+whoami
+cat /etc/passwd                     # all users; shell /bin/bash vs /usr/sbin/nologin
+grep -v nologin /etc/passwd         # users that can log in
+ps aux | grep <user>                # what runs as that user
+su ubuntu / sudo -i                 # switch user
+id <user>; groups <user>            # sudo group membership?
+deluser <user>; usermod -s /usr/sbin/nologin <user>   # remove / lock
+```
+> Least privilege on the host: no unneeded users, no unneeded sudo, services run as dedicated non-root users.
+
+#### Section summary
+- Attack surface
+- Applications / services
+- Network / ports
+- Users / IAM
+
+---
+
+🎓 **Course complete — Killer Shell CKS Full Course (11:06:39) fully documented.**
+
 ## 8. Domain 4 — Minimize Microservice Vulnerabilities
-*Still TODO: Pod Security Admission, securityContext, mTLS/Cilium*
+*Not covered by the video (current curriculum): Cilium transparent encryption (WireGuard/IPsec) — study from cilium.io docs.*
 
 ### 8.1 Manage Kubernetes Secrets
 
@@ -2554,7 +2789,7 @@ The apiserver's startup/liveness/readiness probes (`/livez`, `/readyz`) are **an
 Fix: remove the flag (`sed -i '/--anonymous-auth=false/d' /etc/kubernetes/manifests/kube-apiserver.yaml`). To keep anonymous off properly, use an `AuthenticationConfiguration` that allows anonymous **only** for `/livez`, `/readyz` and `/healthz`.
 
 ## 9. Domain 5 — Supply Chain Security
-*Still TODO: ImagePolicyWebhook, SBOM, image signing (cosign)*
+*Not covered by the video (current curriculum): SBOM (`trivy image --format cyclonedx`, `bom`), image signing (cosign) — study from docs.*
 
 ### 9.1 Image Footprint
 
@@ -3760,6 +3995,19 @@ sha512sum file
 jq . file.json        # pretty-print audit log lines
 ```
 
+#### systemctl / services (Reduce Attack Surface)
+```bash
+systemctl status <svc>                                   # running? which unit + drop-ins loaded
+systemctl cat kubelet                                    # unit + drop-ins → shows --config / --kubeconfig paths
+systemctl list-units --type=service --state=running      # what's running
+systemctl stop <svc> && systemctl disable <svc>          # stop now + after reboot
+systemctl mask <svc>                                     # can't be started at all
+systemctl daemon-reload                                  # after editing unit/drop-in files
+systemctl edit kubelet                                   # create override drop-in
+journalctl -u <svc> -f
+ss -plnt / netstat -plnt ; lsof -i :<port>               # who listens where
+```
+
 #### tmux
 `Ctrl+B %` vertical split · `Ctrl+B "` horizontal · `Ctrl+B` + arrow switch pane.
 
@@ -3788,6 +4036,9 @@ Quick lookup: **error message → section**. Every entry comes from my own lab.
 | `Could not process manifest file ... did not find expected '-' indicator` | YAML indentation in static pod manifest (only in kubelet log) | 10.3 |
 | `loading audit policy file: unknown group version field ... Kind=Policy` | Typo/misplaced field in audit policy | 10.3 |
 | `AH00099: could not create .../httpd.pid` Read-only file system | readOnlyRootFilesystem without emptyDir for writable path | 10.2 |
+| `cannot create /dev/null: Permission denied` (nginx entrypoint) | Restrictive AppArmor profile active (intended) | 7.1 |
+| `OCI runtime start failed: cannot start an already running container` | seccomp profile missing a needed syscall (e.g. `write`) | 7.1 |
+| `Warning: Stopping X.service, but it can still be activated by: X.socket` | Socket activation; also stop+disable the socket | 7.2 |
 | `aa-`: command not found | Prefix only; install `apparmor-utils`, use Tab Tab | 7.1 |
 | `aa-genprof`: `Operation {'runbindable'} cannot have a source` / `Include file ... not found` | Shipped profiles unparseable by utils; move them aside | 7.1 |
 | Falco output has extra `container_id=… k8s_ns_name=…` fields | `append_output.suggested_output: true` in falco.yaml | 10.1 |
